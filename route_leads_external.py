@@ -20,11 +20,11 @@ Creds: odoo_client.cfg() reads env vars first (GitHub secrets) then .env.
 """
 
 import argparse
-import datetime
 import re
 import sys
 
-from odoo_client import OdooClient
+from odoo_client import OdooClient, cfg
+from chat_poster import lead_to_message, post_to_chat
 
 # ----- CONFIG (Supreme Detailing) - identical to the in-Odoo action -----
 REGION_STATE = 517      # res.country.state Auckland (AUK)
@@ -36,10 +36,15 @@ NEWSLETTER_LIST = 1     # mailing.list "Newsletter"
 NORTH = {'milford', 'takapuna', 'castor bay', 'mairangi bay', 'murrays bay',
          'forest hill', 'campbells bay'}
 CENTRAL = {'onehunga', 'royal oak', 'mount eden', 'mount roskill', 'epsom'}
+TEAM_NAME = {TEAM_NORTH: 'North', TEAM_CENTRAL: 'Central', TEAM_TRIAGE: 'Triage'}
+# Job 4 replaces server action #562: website-enquiry contacts -> Chat alert.
+ENQUIRY_TAGS = {1: 'Cart Save', 2: 'Website Enquiry', 3: 'Subscription Interest'}
+ENQUIRY_PARAM = 'sd.enquiry.last_partner'   # high-water-mark of alerted partner id
 # ------------------------------------------------------------------------
 
 ARGS = None
 C = None
+CHAT_HOOK = None
 
 
 def log(msg):
@@ -85,6 +90,32 @@ def do_create(model, vals):
         vlog(f"DRY create {model} <- {vals}")
         return -1  # sentinel id in dry-run
     return create(model, vals)
+
+
+def get_param(key, default="0"):
+    return C.call("ir.config_parameter", "get_param", key, default)
+
+
+def set_param(key, value):
+    if ARGS and ARGS.dry_run:
+        vlog(f"DRY set_param {key}={value}")
+        return True
+    return C.call("ir.config_parameter", "set_param", key, value)
+
+
+def chat_alert(d):
+    """Best-effort Google Chat card. Never breaks routing; no-op without a hook."""
+    if not CHAT_HOOK:
+        return
+    label = d.get("contact_name") or d.get("name") or d.get("email_from") or "?"
+    if ARGS and ARGS.dry_run:
+        vlog(f"DRY chat alert: {label}")
+        return
+    try:
+        ok = post_to_chat(lead_to_message(d, C.url), CHAT_HOOK)
+        vlog(f"chat posted={ok} ({label})")
+    except Exception as e:  # noqa: BLE001 - alerts must never fail the job
+        log(f"  [chat] skipped ({label}): {e}")
 
 
 # ---- parsing/routing (faithful, but free to use re externally) ----
@@ -213,6 +244,10 @@ def job_leads():
                            "list_ids": [(4, NEWSLETTER_LIST)]})
             log(f"sd-routing: subscribed {lead['email_from']} to Newsletter")
 
+        chat_alert({"id": lead["id"], "_model": "crm.lead", "_kind": f"{tagnames[-1]} web lead",
+                    "contact_name": person, "email_from": lead["email_from"],
+                    "phone": lead.get("phone"), "city": suburb if reg else None,
+                    "team_id": [team_id, TEAM_NAME.get(team_id, "—")]})
         log(f"sd-routing: lead {lead['id']} -> {ltype} ({reg or 'other'}) team {team_id}")
         n += 1
     return n
@@ -256,6 +291,11 @@ def job_orders():
                 "tag_ids": [(6, 0, tag_ids)],
             })
         write("sale.order", o["id"], {"opportunity_id": opp_id})
+        chat_alert({"id": opp_id, "_model": "crm.lead", "_kind": f"web order {o['name']}",
+                    "contact_name": o["partner_id"][1] if o.get("partner_id") else None,
+                    "email_from": cust.get("email"), "phone": cust.get("phone"),
+                    "city": suburb, "team_id": [team_id, TEAM_NAME.get(team_id, "—")],
+                    "expected_revenue": o.get("amount_total")})
         log(f"sd-routing: order {o['name']} -> team {team_id} opp {opp_id} ({reg or 'other'})")
         n += 1
     return n
@@ -314,29 +354,81 @@ def job_bookings():
         lv = {"team_id": team_id, "tag_ids": [(4, t) for t in tag_ids]}
         lv.update(pgeo)
         write("crm.lead", opp["id"], lv)
+        pname = (read("res.partner", [opp["partner_id"][0]], ["name"])[0].get("name")
+                 if opp.get("partner_id") else None)
+        chat_alert({"id": opp["id"], "_model": "crm.lead", "_kind": "booking",
+                    "contact_name": pname, "city": suburb,
+                    "team_id": [team_id, TEAM_NAME.get(team_id, "—")]})
         log(f"sd-routing: booking opp {opp['id']} -> team {team_id} ({reg or 'other'}) street={street}")
         n += 1
     return n
 
 
+# ---------- JOB 4: website-enquiry contacts -> Chat (replaces action #562) ----------
+def job_enquiries():
+    if not CHAT_HOOK:
+        vlog("job4: no GCHAT_WEBHOOK_URL — skipping enquiry alerts")
+        return 0
+    tags = list(ENQUIRY_TAGS)
+    raw = get_param(ENQUIRY_PARAM, "")
+    if raw in ("", False, None):
+        # First ever run: baseline to the current max so we DON'T flood the space
+        # with every historical enquiry contact. Only future ones alert.
+        newest = search("res.partner", [["category_id", "in", tags]],
+                        order="id desc", limit=1)
+        base = newest[0] if newest else 0
+        set_param(ENQUIRY_PARAM, str(base))
+        log(f"sd-routing: job4 baselined {ENQUIRY_PARAM}={base} (no historical alerts)")
+        return 0
+    last = int(raw or "0")
+    parts = search_read(
+        "res.partner",
+        [["category_id", "in", tags], ["id", ">", last]],
+        ["id", "name", "email", "phone", "city", "category_id"],
+        order="id asc",
+    )
+    vlog(f"job4: {len(parts)} new enquiry contacts (id > {last})")
+    maxid = last
+    n = 0
+    for p in parts:
+        if p["id"] > maxid:
+            maxid = p["id"]
+        cats = [t for t in (p.get("category_id") or []) if t in ENQUIRY_TAGS]
+        label = " / ".join(ENQUIRY_TAGS[t] for t in cats) or "Website enquiry"
+        chat_alert({"id": p["id"], "_model": "res.partner", "_kind": label,
+                    "contact_name": p.get("name"), "email_from": p.get("email"),
+                    "phone": p.get("phone"), "city": p.get("city")})
+        log(f"sd-routing: enquiry {p['id']} ({label}) -> Chat")
+        n += 1
+    if maxid > last:
+        set_param(ENQUIRY_PARAM, str(maxid))
+        vlog(f"advanced {ENQUIRY_PARAM} {last} -> {maxid}")
+    return n
+
+
 def main():
-    global ARGS, C
+    global ARGS, C, CHAT_HOOK
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="read + log, write nothing")
     ap.add_argument("--verbose", action="store_true")
     ARGS = ap.parse_args()
 
     C = OdooClient()
+    try:
+        CHAT_HOOK = cfg("GCHAT_WEBHOOK_URL")
+    except Exception:  # noqa: BLE001 - Chat is optional
+        CHAT_HOOK = None
     mode = "DRY-RUN" if ARGS.dry_run else "LIVE"
-    log(f"sd-routing [{mode}] connected uid={C.uid} db={C.db}")
+    log(f"sd-routing [{mode}] connected uid={C.uid} db={C.db} chat={'on' if CHAT_HOOK else 'off'}")
     try:
         a = job_leads()
         b = job_orders()
         d = job_bookings()
-    except Exception as e:  # noqa: BLE001 - surface, never swallow
-        log(f"sd-routing ERROR: {type(e).__name__}: {e}")
+        e = job_enquiries()
+    except Exception as exc:  # noqa: BLE001 - surface, never swallow
+        log(f"sd-routing ERROR: {type(exc).__name__}: {exc}")
         sys.exit(1)
-    log(f"sd-routing done [{mode}] leads={a} orders={b} bookings={d} errors=0")
+    log(f"sd-routing done [{mode}] leads={a} orders={b} bookings={d} enquiries={e} errors=0")
 
 
 if __name__ == "__main__":
