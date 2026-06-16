@@ -1,0 +1,43 @@
+name: Route leads & orders
+
+# Replaces Odoo cron 56 (every 3 min) / server action #715. Runs the externalised
+# router so no billable custom code lives in Odoo. Best-effort Chat alerts if
+# GCHAT_WEBHOOK_URL is set.
+on:
+  schedule:
+    # Wide UTC band covers NZ business hours in BOTH offsets (NZST=UTC+12, NZDT=UTC+13).
+    # The real cutoff is the in-job Pacific/Auckland gate below — DST-proof year-round.
+    - cron: "*/15 0-9,20-23 * * *"
+  workflow_dispatch: {}   # manual "Run workflow" button
+
+concurrency:
+  group: route-leads        # single instance; a new run never overlaps a slow one
+  cancel-in-progress: false
+
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Gate to NZ business hours (09:00-21:00 Pacific/Auckland)
+        id: gate
+        run: |
+          H=$(TZ='Pacific/Auckland' date +%H)
+          echo "NZ hour = $H"
+          if [ "$H" -lt 9 ] || [ "$H" -ge 21 ]; then
+            echo "outside window — no-op"; echo "run=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Route
+        if: steps.gate.outputs.run == 'yes'
+        env:
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USER: ${{ secrets.ODOO_USER }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+          GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}
+        run: python route_leads_external.py --verbose

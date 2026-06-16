@@ -1,0 +1,14 @@
+# NEVER commit credentials — they live in GitHub repo secrets, not the repo.
+.env
+.env.*
+*.key
+
+# Python
+__pycache__/
+*.pyc
+
+# Local run artefacts
+logs/
+*.log
+.chat_bridge_state.json
+.*_state.json
