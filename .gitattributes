@@ -1,0 +1,6 @@
+# Force LF so workflow bash steps run cleanly on Ubuntu runners (CRLF breaks
+# the `run:` shell with $'\r' errors). Applies to scripts + YAML.
+* text=auto eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
