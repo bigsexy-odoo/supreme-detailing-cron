@@ -1,4 +1,5 @@
 name: Loyalty maintenance
+# externalised from Odoo cron 62 / server action #760
 
 # Replaces Odoo cron 62 (every 10 min) / server action #760. Loyalty expiry +
 # membership credits are a daily batch — no need for sub-hour cadence.

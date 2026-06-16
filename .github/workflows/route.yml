@@ -1,4 +1,4 @@
-name: Route leads & orders
+name: Route leads and orders
 
 # Replaces Odoo cron 56 (every 3 min) / server action #715. Runs the externalised
 # router so no billable custom code lives in Odoo. Best-effort Chat alerts if
