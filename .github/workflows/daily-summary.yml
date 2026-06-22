@@ -1,0 +1,44 @@
+name: Daily job summary
+
+# Posts tomorrow's bookings to Google Chat at 6pm NZST.
+# One message per resource space (SD North / SD Central).
+on:
+  schedule:
+    # 6:00 AM UTC = 6:00 PM NZST (UTC+12)
+    # 5:00 AM UTC = 6:00 PM NZDT (UTC+13)
+    # Run at both to cover DST transitions — the NZ gate picks the right one.
+    - cron: "0 5,6 * * *"
+  workflow_dispatch: {}   # manual "Run workflow" button
+
+concurrency:
+  group: daily-summary
+  cancel-in-progress: false
+
+jobs:
+  summary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Gate to 6pm NZST/NZDT (hour 18 in Pacific/Auckland)
+        id: gate
+        run: |
+          H=$(TZ='Pacific/Auckland' date +%H)
+          echo "NZ hour = $H"
+          if [ "$H" -ne 18 ]; then
+            echo "not 6pm NZ — no-op"; echo "run=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Post daily summary to Google Chat
+        if: steps.gate.outputs.run == 'yes'
+        env:
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USER: ${{ secrets.ODOO_USER }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+          GCHAT_NORTH_WEBHOOK: ${{ secrets.GCHAT_NORTH_WEBHOOK }}
+          GCHAT_CENTRAL_WEBHOOK: ${{ secrets.GCHAT_CENTRAL_WEBHOOK }}
+        run: python daily_summary.py
