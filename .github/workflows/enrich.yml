@@ -1,0 +1,43 @@
+name: Enrich calendar events
+
+# Polls for new appointment bookings and writes vehicle, address, services,
+# and contact details into the calendar event description + location fields.
+# Data then syncs to Google Calendar automatically.
+on:
+  schedule:
+    # Every 15 min during the UTC band that covers NZ business hours (both NZST+NZDT).
+    # The in-job NZ gate narrows to 07:00-21:00 Pacific/Auckland — catches morning
+    # bookings before the boys start and evening ones after.
+    - cron: "*/15 0-9,18-23 * * *"
+  workflow_dispatch: {}   # manual "Run workflow" button
+
+concurrency:
+  group: enrich-calendar
+  cancel-in-progress: false
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Gate to NZ hours (07:00-21:00 Pacific/Auckland)
+        id: gate
+        run: |
+          H=$(TZ='Pacific/Auckland' date +%H)
+          echo "NZ hour = $H"
+          if [ "$H" -lt 7 ] || [ "$H" -ge 21 ]; then
+            echo "outside window — no-op"; echo "run=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Enrich calendar events
+        if: steps.gate.outputs.run == 'yes'
+        env:
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USER: ${{ secrets.ODOO_USER }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+        run: python enrich_calendar_events.py
