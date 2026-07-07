@@ -165,7 +165,8 @@ def carousel_slides(reviews: list, max_items: int = 6) -> str:
     for i, r in enumerate(reviews[:max_items]):
         active = " active" if i == 0 else ""
         who = _esc(_clean_author(r["author"]))
-        date = f'<br/>{_esc(r["date"])}' if r["date"] else ""
+        prov = f'Google review · {_esc(r["date"])}' if r["date"] else "Google review"
+        date = f'<br/><span class="text-muted">{prov}</span>'
         stars = "★" * max(1, min(5, r["rating"]))
         out.append(
             f'<div class="carousel-item{active} oe_img_bg o_bg_img_center pb80 pt168 o_colored_level" data-name="Slide">'
