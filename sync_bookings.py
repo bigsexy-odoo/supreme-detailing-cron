@@ -97,7 +97,10 @@ RESOURCE_TAG = {1: 1, 2: 2}   # appointment.resource id -> calendar.event.type (
 # The Meetings calendar colours by ATTENDEE, so add the detailer as a calendar attendee
 # whose partner carries a preset colour (Alex=green/10, Kade=red/1). One-time owner step:
 # in Calendar sidebar '+ Add Attendees' -> tick Alex + Kade to colour/filter bookings by detailer.
-RESOURCE_PARTNER = {1: 69, 2: 70}   # appointment.resource id -> detailer res.partner id (unused in Option B)
+RESOURCE_PARTNER = {1: 69, 2: 70}   # appointment.resource id -> detailer CONTACT (res.partner)
+# Alex/Kade are both the RESOURCE (lanes/availability) and a PARTICIPANT contact (added to
+# each event so it shows on the main calendar + auto-colours by detailer). Tick these two in
+# the Calendar 'Attendees' sidebar; set the swatches to green (Alex) / red (Kade) once.
 # OPTION B: the Meetings calendar colours by ATTENDEE, so colour by PAID STATUS via a
 # status partner attendee (Paid=green / Awaiting=red). Detailer is shown by an A/K letter
 # in the title. One-time owner step: in Calendar sidebar tick '✅ Paid' (green swatch) +
@@ -147,6 +150,31 @@ def vlog(msg):
 # ---------------------------------------------------------------------------
 # SDBK1 parsing + resource / time resolution
 # ---------------------------------------------------------------------------
+def type_code(service_label):
+    """2-letter booking-type code for the calendar tile:
+    EP Exterior · IP Interior · SD Supreme · PO Pet Owner · RS Re-Sell (Sell-Ready)."""
+    l = (service_label or "").lower()
+    if "exterior" in l:
+        return "EP"
+    if "interior" in l:
+        return "IP"
+    if "supreme" in l:
+        return "SD"
+    if "pet" in l:
+        return "PO"
+    if "sell" in l or "resell" in l or "re-sell" in l:
+        return "RS"
+    return (service_label[:2] or "??").upper()
+
+
+def tile_title(sdbk, order, resource_name):
+    """[✅ if paid] [A/K detailer] CODE Suburb  e.g. '✅ K SD Onehunga' or 'A EP Milford'.
+    ✅ = paid (blank = unpaid); A=Alex / K=Kade; EP/IP/SD/PO/RS = booking type."""
+    tick = "✅ " if is_paid(order) else ""
+    ini = (resource_name[:1] or "").upper()   # A (Alex) / K (Kade)
+    return f"{tick}{ini} {type_code(sdbk['service_label'])} {sdbk['suburb']}"
+
+
 def parse_sdbk1(raw):
     """Parse an SDBK1 pipe string into a dict, or return None if not one/malformed."""
     if not raw:
@@ -446,11 +474,10 @@ def process(rec, writer):
         desc = (ev[0].get("description") if ev else "") or ""
         if want not in desc:
             if not ARGS.dry_run:
+                # paid status now lives in the TITLE (✅ tick), so refresh the title + body
                 C.call("calendar.event", "write", [existing],
-                       {"description": build_description(sdbk, resource_name, lid, order),
-                        # flip the colour: drop the old status partner, add the new one
-                        "partner_ids": [(3, STATUS_PARTNER[not is_paid(order)]),
-                                        (4, STATUS_PARTNER[is_paid(order)])]},
+                       {"name": tile_title(sdbk, order, resource_name),
+                        "description": build_description(sdbk, resource_name, lid, order)},
                        context=NOISE_OFF)
             newstat = "PAID" if is_paid(order) else "AWAITING"
             log(f"  {oname} L{lid}: event {existing} status -> {newstat} (updated)")
@@ -487,10 +514,7 @@ def process(rec, writer):
 
     # Tile-friendly title: paid marker + customer + short service + suburb (time shows
     # automatically on the calendar tile; detailer shows via colour/description).
-    _svc_short = sdbk["service_label"].replace(" Package", "").split(" (")[0].strip()
-    _ini = (resource_name[:1] or "?").upper()   # A (Alex) / K (Kade) — detailer at a glance
-    # Colour carries paid status (Option B), so the letter+service+suburb is the tile text.
-    ename = f"{_ini} · {_svc_short} · {sdbk['suburb']}"
+    ename = tile_title(sdbk, order, resource_name)
     location = f"{sdbk['suburb']}, Auckland" if sdbk["suburb"] else "Auckland"
 
     # --- Email eligibility (present address + future + not --no-email) ---
@@ -533,9 +557,7 @@ def process(rec, writer):
         # Attendees = the customer AND the org partner, so the booking shows on the
         # single Supreme Detailing calendar (Odoo Calendar filters to "my" attendees;
         # detailer separation is via appointment_resource_ids + the description).
-        # Colour-by-paid: the status partner (green/red) + the customer (for the email).
-        "partner_ids": [(6, 0, list(dict.fromkeys(
-            [p for p in [STATUS_PARTNER[is_paid(order)], booker_id] if p])))],
+        "partner_ids": [(6, 0, [booker_id])] if booker_id else [(6, 0, [])],
         "appointment_booker_id": booker_id,
         "appointment_type_id": sdbk["appt_type_id"],
         # Assign the detailer via a booking line (carries capacity) -- NOT the m2m
@@ -556,6 +578,17 @@ def process(rec, writer):
     if isinstance(event_id, (list, tuple)):
         event_id = event_id[0]
     log(f"      created calendar.event {event_id}")
+
+    # The appointment create strips partner_ids to the booker, so add the DETAILER contact
+    # (Alex/Kade) as a participant via a follow-up write (verified to stick). This makes the
+    # detailer BOTH the resource (lanes/availability) AND a participant -> the booking shows
+    # on the main Meetings calendar (which only surfaces events whose participants you've
+    # ticked) AND auto-colours by detailer (the calendar colours by participant). Contacts,
+    # not Odoo user accounts -> no paid seats.
+    _detailer_partner = RESOURCE_PARTNER.get(resource_id)
+    if _detailer_partner:
+        C.call("calendar.event", "write", [event_id],
+               {"partner_ids": [(4, _detailer_partner)]}, context=NOISE_OFF)
 
     # --- Order-level audit token ---
     append_order_marker(order, lid, event_id)
