@@ -469,7 +469,13 @@ def process(rec, writer):
                          f"overlaps {conflicts} on res{resource_id}"])
         return "conflict"
 
-    ename = f"{partner_name} - {sdbk['service_label']} Booking"
+    # Tile-friendly title: paid marker + customer + short service + suburb (time shows
+    # automatically on the calendar tile; detailer shows via colour/description).
+    _cust = (partner_name or "").split(" - ")[0].strip()
+    _cust_short = (_cust.split()[0] if _cust else "") or "Booking"
+    _svc_short = sdbk["service_label"].replace(" Package", "").split(" (")[0].strip()
+    _paid = "✅" if is_paid(order) else "⏳"   # ✅ paid / ⏳ awaiting
+    ename = f"{_paid} {_cust_short} · {_svc_short} · {sdbk['suburb']}"
     location = f"{sdbk['suburb']}, Auckland" if sdbk["suburb"] else "Auckland"
 
     # --- Email eligibility (present address + future + not --no-email) ---
