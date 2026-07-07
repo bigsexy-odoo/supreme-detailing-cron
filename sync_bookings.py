@@ -509,7 +509,10 @@ def process(rec, writer):
         "duration": sdbk["duration"],
         "partner_id": ORGANIZER_PARTNER,
         "user_id": ORGANIZER_USER,
-        "partner_ids": [(6, 0, [booker_id])] if booker_id else [(6, 0, [])],
+        # Attendees = the customer AND the org partner, so the booking shows on the
+        # single Supreme Detailing calendar (Odoo Calendar filters to "my" attendees;
+        # detailer separation is via appointment_resource_ids + the description).
+        "partner_ids": [(6, 0, list(dict.fromkeys([p for p in [ORGANIZER_PARTNER, booker_id] if p])))],
         "appointment_booker_id": booker_id,
         "appointment_type_id": sdbk["appt_type_id"],
         # Assign the detailer via a booking line (carries capacity) -- NOT the m2m
