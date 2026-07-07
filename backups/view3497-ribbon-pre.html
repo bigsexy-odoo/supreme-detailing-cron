@@ -1,0 +1,120 @@
+<data inherit_id="website.layout" name="SD: Nav testimonial rotator">
+    <xpath expr="//head" position="inside">
+        <style type="text/css">
+/* Testimonial announcement bar above nav */
+.sd-testimonial-bar {
+    display: block;
+    background: #F5F5F5;
+    border-bottom: 1px solid rgba(0,0,0,0.05);
+    text-align: center;
+    height: 28px;
+    position: relative;
+    overflow: hidden;
+}
+.sd-testimonial-bar .sd-nq {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    transform: translateX(100%);
+    transition: transform 0.8s ease-in-out, opacity 0.8s ease-in-out;
+    opacity: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 28px;
+    font-size: 0.76rem;
+    padding: 0 20px;
+}
+.sd-testimonial-bar .sd-nq.active {
+    transform: translateX(0);
+    opacity: 1;
+}
+.sd-testimonial-bar .sd-nq.sd-exit {
+    transform: translateX(-100%);
+    opacity: 0;
+}
+.sd-testimonial-bar .sd-stars {
+    color: #F59E0B;
+    letter-spacing: 1px;
+    margin-right: 6px;
+    font-size: 0.65rem;
+}
+.sd-testimonial-bar em {
+    color: #737373;
+    font-style: italic;
+}
+.sd-testimonial-bar strong {
+    color: #525252;
+    font-weight: 600;
+    margin-left: 4px;
+    font-size: 0.7rem;
+}
+
+/* Push fixed cart sidebar down to account for the testimonial bar */
+html:not(.o_connected_user) aside.d-lg-block[style*="position: fixed"],
+html:not(.o_connected_user) aside.d-lg-block[style*="position:fixed"] {
+    margin-top: 28px !important;
+}
+
+/* Hide for logged-in users */
+html.o_connected_user .sd-testimonial-bar {
+    display: none !important;
+}
+
+/* Hide on mobile */
+@media (max-width: 767px) {
+    .sd-testimonial-bar {
+        display: none !important;
+    }
+}
+        </style>
+        <script type="text/javascript">
+(function() {
+    'use strict';
+    if (document.querySelector('html').classList.contains('o_connected_user')) return;
+    var quotes = [
+        {text: "We use Supreme Detailing to detail our employees’ cars as a reward for hitting our team…", author: "Stephen Karena", date: "Jul 2026"},
+        {text: "Great young lads. They made my car look brand new again. Would definitely recommend them.", author: "Hunter Hosken", date: "Jul 2026"},
+        {text: "Used this service for washing and detailing a well used rental car while visiting. Alex…", author: "Bruce Thomson", date: "Jul 2026"},
+        {text: "Fantastic service from start to finish. My car came back looking immaculate, with great…", author: "Ana Vulinovich", date: "Jul 2026"},
+        {text: "Alex has been detailing by car for the past 2 years. I am very happy with the quality of…", author: "Natasha MacLeod", date: "Jul 2026"}
+    ];
+    function buildBar(header) {
+        var bar = document.createElement('div');
+        bar.className = 'sd-testimonial-bar';
+        quotes.forEach(function(q, i) {
+            var span = document.createElement('span'); span.className = 'sd-nq' + (i === 0 ? ' active' : '');
+            var stars = document.createElement('span'); stars.className = 'sd-stars'; stars.textContent = '★★★★★'; span.appendChild(stars);
+            var em = document.createElement('em'); em.textContent = '"' + q.text + '"'; span.appendChild(em);
+            var strong = document.createElement('strong'); strong.textContent = ' — ' + q.author + ', ' + q.date; span.appendChild(strong);
+            bar.appendChild(span);
+        });
+        header.insertBefore(bar, header.firstChild);
+        return bar;
+    }
+    function init() {
+        var bar = document.querySelector('.sd-testimonial-bar');
+        if (!bar) { var header = document.querySelector('header'); if (!header) return false; bar = buildBar(header); }
+        if (bar.getAttribute('data-sd-rot')) return true;
+        bar.setAttribute('data-sd-rot', '1');
+        var idx = 0;
+        setInterval(function() {
+            var items = bar.querySelectorAll('.sd-nq');
+            if (!items.length) return;
+            var old = items[idx];
+            old.classList.add('sd-exit'); old.classList.remove('active');
+            idx = (idx + 1) % items.length;
+            items[idx].classList.add('active');
+            setTimeout(function() { old.classList.remove('sd-exit'); }, 900);
+        }, 4000);
+        return true;
+    }
+    if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', function(){ var iv=setInterval(function(){ if(init()) clearInterval(iv); },200); }); } else { var iv=setInterval(function(){ if(init()) clearInterval(iv); },200); }
+})();
+        </script>
+    </xpath>
+<xpath expr="//header/*[1]" position="before">
+        <div class="sd-testimonial-bar"><span class="sd-nq active"><span class="sd-stars">★★★★★</span><em>"We use Supreme Detailing to detail our employees’ cars as a reward for hitting our team…"</em><strong> — Stephen Karena, Jul 2026</strong></span><span class="sd-nq"><span class="sd-stars">★★★★★</span><em>"Great young lads. They made my car look brand new again. Would definitely recommend them."</em><strong> — Hunter Hosken, Jul 2026</strong></span><span class="sd-nq"><span class="sd-stars">★★★★★</span><em>"Used this service for washing and detailing a well used rental car while visiting. Alex…"</em><strong> — Bruce Thomson, Jul 2026</strong></span><span class="sd-nq"><span class="sd-stars">★★★★★</span><em>"Fantastic service from start to finish. My car came back looking immaculate, with great…"</em><strong> — Ana Vulinovich, Jul 2026</strong></span><span class="sd-nq"><span class="sd-stars">★★★★★</span><em>"Alex has been detailing by car for the past 2 years. I am very happy with the quality of…"</em><strong> — Natasha MacLeod, Jul 2026</strong></span></div>
+    </xpath>
+</data>

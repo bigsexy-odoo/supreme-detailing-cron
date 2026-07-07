@@ -1,0 +1,45 @@
+name: Google reviews refresh
+
+# Refreshes the top ribbon (view 3497) AND the homepage testimonial carousel
+# (view 585 #reviews) with the latest Google reviews, keeping their formats.
+# Idempotent — only writes when the reviews changed.
+#
+# Cadence: every 2 hours, 6am–12pm NZ (06, 08, 10, 12). The UTC schedule covers
+# both NZST (UTC+12) and NZDT (UTC+13); the NZ-hour gate keeps only the 4 target
+# hours, so exactly 4 real runs/day regardless of daylight saving.
+on:
+  schedule:
+    - cron: "0 0,17,18,19,20,21,22,23 * * *"
+  workflow_dispatch: {}     # manual "Run workflow" button
+
+concurrency:
+  group: reviews
+  cancel-in-progress: false
+
+jobs:
+  reviews:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Gate to NZ 06/08/10/12
+        id: gate
+        run: |
+          H=$(TZ='Pacific/Auckland' date +%H)
+          echo "NZ hour = $H"
+          case "$H" in
+            06|08|10|12) echo "run=yes" >> "$GITHUB_OUTPUT" ;;
+            *) echo "outside 6am-12pm 2-hourly window — no-op"; echo "run=no" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - name: Refresh reviews (ribbon + carousel)
+        if: steps.gate.outputs.run == 'yes'
+        env:
+          GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+          GOOGLE_PLACE_ID: ${{ secrets.GOOGLE_PLACE_ID }}
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USER: ${{ secrets.ODOO_USER }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+        run: python fetch_google_reviews.py --commit
