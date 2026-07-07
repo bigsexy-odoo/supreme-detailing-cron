@@ -93,7 +93,11 @@ SMS_ALARM = 8               # "SMS Text Message - 1 Hours" -- real IAP credits, 
 BOOKED_TEMPLATE = 37        # mail.template "Appointment: Attendee Invitation" (model calendar.attendee)
 # Calendar colour tags (calendar.event.type): North Shore/Alex=green, Central/Kade=red.
 # Only shows if the Meetings calendar (view 2430) colours by categ_ids (set up separately).
-RESOURCE_TAG = {1: 1, 2: 2}   # appointment.resource id -> calendar.event.type (tag) id
+RESOURCE_TAG = {1: 1, 2: 2}   # appointment.resource id -> calendar.event.type (tag) id (popup label)
+# The Meetings calendar colours by ATTENDEE, so add the detailer as a calendar attendee
+# whose partner carries a preset colour (Alex=green/10, Kade=red/1). One-time owner step:
+# in Calendar sidebar '+ Add Attendees' -> tick Alex + Kade to colour/filter bookings by detailer.
+RESOURCE_PARTNER = {1: 69, 2: 70}   # appointment.resource id -> detailer res.partner id
 NZ = ZoneInfo("Pacific/Auckland")   # DST-correct: NZST=UTC+12, NZDT=UTC+13
 UTC = ZoneInfo("UTC")
 
@@ -521,7 +525,8 @@ def process(rec, writer):
         # Attendees = the customer AND the org partner, so the booking shows on the
         # single Supreme Detailing calendar (Odoo Calendar filters to "my" attendees;
         # detailer separation is via appointment_resource_ids + the description).
-        "partner_ids": [(6, 0, list(dict.fromkeys([p for p in [ORGANIZER_PARTNER, booker_id] if p])))],
+        "partner_ids": [(6, 0, list(dict.fromkeys(
+            [p for p in [ORGANIZER_PARTNER, RESOURCE_PARTNER.get(resource_id), booker_id] if p])))],
         "appointment_booker_id": booker_id,
         "appointment_type_id": sdbk["appt_type_id"],
         # Assign the detailer via a booking line (carries capacity) -- NOT the m2m
