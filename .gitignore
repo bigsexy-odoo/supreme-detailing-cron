@@ -12,3 +12,10 @@ logs/
 *.log
 .chat_bridge_state.json
 .*_state.json
+
+# Single-instance lock (runtime)
+.sync_bookings.lock
+
+# Session diagnostic probes
+_reaper_*.py
+_reaper_*.txt

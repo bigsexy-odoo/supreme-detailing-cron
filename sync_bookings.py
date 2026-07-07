@@ -18,10 +18,20 @@ SDBK1 capture format (one custom-attribute-value string per booked line):
 
 ------------------------------------------------------------------------------
 SAFETY / REVIEW FIXES folded in (do NOT silently regress these):
-  * ELIGIBILITY: default states = ["sale", "done"] ONLY. 'sent' is a verified
-    UNPAID quotation on this DB (17 live 'sent' orders, invoice_status='no',
-    0 completed payment tx) -> it is opt-in behind --include-sent with a loud
-    warning. An unattended cron that SENDS EMAIL must never act on unpaid quotes.
+  * ELIGIBILITY: the shop takes bank-transfer / cash-on-the-day, so a genuine
+    booking often stays 'sent' (AWAITING PAYMENT) -- those DO go on the calendar
+    (owner's Phase-2 decision), shown as awaiting vs paid. But 'sent' is eligible
+    ONLY with a payment intent that is not failed/cancelled (a pending transfer /
+    authorized / done tx); a bare quote or a failed-card abandonment is excluded,
+    so the unattended cron never emails an unpaid non-booking. sale/done = paid.
+  * SINGLE-INSTANCE LOCK: a --commit run takes an O_EXCL lock so a manual backfill
+    and the scheduled cron can't overlap and double-create / double-email.
+  * DETAILER-COLOUR EMAIL GUARD: the detailer contacts (RESOURCE_PARTNER) MUST
+    carry an email or Odoo reaps them from the attendee list ~80s later and the
+    colour vanishes. A --commit run HARD-STOPS if either is missing.
+  * EMAIL VIA QUEUE: template 37 is queued (force_send=False) so a daily-cap trip
+    leaves it 'outgoing' for Odoo to retry, never lost. --max defaults to 25 so a
+    naive --commit self-throttles under the cap (re-run to continue; --max 0=all).
   * BOUNDED IDEMPOTENCY MARKER: the per-line marker is searched as the FULL
     delimited HTML comment  <!-- SDBK1:L<id> -->  so line 12 can never match
     line 123 (an unbounded ilike 'SDBK1:L12' would). Plus an order-ref audit
@@ -59,15 +69,16 @@ Usage:
     python sync_bookings.py --since 2026-07-01      # only orders with date_order >= this
     python sync_bookings.py --commit --with-sms     # also schedule the SMS reminder (alarm 8)
     python sync_bookings.py --commit --include-past # backfill past bookings (event only, no email/sms)
-    python sync_bookings.py --commit --include-sent # ALSO act on unpaid 'sent' quotes (NOT recommended)
-    python sync_bookings.py --commit --max 5        # cap this run to 5 creations (throttle email cap)
+    python sync_bookings.py --commit --max 5        # cap this run to 5 creations (default 25; 0=all)
 Creds: odoo_client.cfg() reads env vars first (GitHub secrets) then .env.
 """
 
 import argparse
 import csv
 import io
+import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -89,24 +100,32 @@ ORGANIZER_USER = 2          # user_id on event 2. NOTE: appointment.resource car
                             # ONLY via appointment_resource_ids. Confirm with the owner
                             # that resource-only separation is acceptable.
 BASE_ALARMS = [3, 6]        # Notification 1h + Email 3h. SMS (id 8) added only with --with-sms.
+EMAIL_ALARM = 6             # "Email 3h" -- event-level, so it emails EVERY attendee (booker AND
+                            # the detailer contact). Dropped under --no-email so a 'safe test'
+                            # sends NO mail at all. NB: detailer 69/70 thus get a job-reminder
+                            # email per booking -- intended (see DEPLOY doc cap math).
 SMS_ALARM = 8               # "SMS Text Message - 1 Hours" -- real IAP credits, off by default.
+                            # Event-level too: will also text the detailer if 69/70 carry a
+                            # phone. Keep 69/70 phone BLANK unless you want to pay for that.
 BOOKED_TEMPLATE = 37        # mail.template "Appointment: Attendee Invitation" (model calendar.attendee)
 # Calendar colour tags (calendar.event.type): North Shore/Alex=green, Central/Kade=red.
 # Only shows if the Meetings calendar (view 2430) colours by categ_ids (set up separately).
 RESOURCE_TAG = {1: 1, 2: 2}   # appointment.resource id -> calendar.event.type (tag) id (popup label)
-# The Meetings calendar colours by ATTENDEE, so add the detailer as a calendar attendee
-# whose partner carries a preset colour (Alex=green/10, Kade=red/1). One-time owner step:
-# in Calendar sidebar '+ Add Attendees' -> tick Alex + Kade to colour/filter bookings by detailer.
-RESOURCE_PARTNER = {1: 69, 2: 70}   # appointment.resource id -> detailer CONTACT (res.partner)
-# Alex/Kade are both the RESOURCE (lanes/availability) and a PARTICIPANT contact (added to
-# each event so it shows on the main calendar + auto-colours by detailer). Tick these two in
-# the Calendar 'Attendees' sidebar; set the swatches to green (Alex) / red (Kade) once.
-# OPTION B: the Meetings calendar colours by ATTENDEE, so colour by PAID STATUS via a
-# status partner attendee (Paid=green / Awaiting=red). Detailer is shown by an A/K letter
-# in the title. One-time owner step: in Calendar sidebar tick '✅ Paid' (green swatch) +
-# '⏳ Awaiting Payment' (red swatch); untick everything else. Filtering to Awaiting = a
-# ready-made "who still owes me" view.
-STATUS_PARTNER = {True: 71, False: 72}   # is_paid -> res.partner (✅ Paid green / ⏳ Awaiting red)
+# COLOUR-BY-DETAILER. Alex/Kade are BOTH the appointment RESOURCE (lanes/availability via
+# booking_line_ids) AND a PARTICIPANT contact added to each event. The main Meetings calendar
+# (attendee_calendar js_class) colours by ATTENDEE, so once the detailer contact is a
+# participant the booking auto-colours by detailer (green North Shore / red Central) and
+# shows for anyone who ticks that detailer in the Calendar 'Attendees' sidebar.
+#
+# *** CRITICAL (root cause of the "colour vanishes ~1 min later" bug, verified 2026-07-08):
+# Odoo's calendar attendee sync REAPS any attendee whose res.partner has NO email, ~60-80s
+# after the event is created/modified. The emailless detailer contact gets silently stripped
+# and the colour disappears. FIX: the detailer contacts MUST carry an email. ensure the
+# owner sets a real one; ensure_detailer_attendee() warns loudly if it's missing. ***
+RESOURCE_PARTNER = {1: 69, 2: 70}   # appointment.resource id -> detailer CONTACT (res.partner, MUST have email)
+# Contacts, not Odoo user accounts -> no paid seats. Set the sidebar swatches green
+# (Alex/North Shore) / red (Kade/Central) once. Paid status is shown by a ✅ tick in the
+# TITLE (not by colour), so a glance gives detailer (colour) + paid (tick) + type + suburb.
 NZ = ZoneInfo("Pacific/Auckland")   # DST-correct: NZST=UTC+12, NZDT=UTC+13
 UTC = ZoneInfo("UTC")
 
@@ -136,6 +155,7 @@ C = None
 ARGS = None
 _RESOURCES = {}     # id -> name, loaded once
 _APPT_TYPES = set()  # valid appointment.type ids, loaded once
+_CREATED = 0        # (would-)creations this run -- the --max cap counts against this
 
 
 def log(msg):
@@ -173,6 +193,45 @@ def tile_title(sdbk, order, resource_name):
     tick = "✅ " if is_paid(order) else ""
     ini = (resource_name[:1] or "").upper()   # A (Alex) / K (Kade)
     return f"{tick}{ini} {type_code(sdbk['service_label'])} {sdbk['suburb']}"
+
+
+def detailer_partner_for(resource_id):
+    """The detailer CONTACT (res.partner) that mirrors this appointment.resource.
+    Returns (partner_id, has_email). The contact MUST carry an email or Odoo's calendar
+    attendee sync reaps it ~60-80s later (the 'colour vanishes' root cause)."""
+    pid = RESOURCE_PARTNER.get(resource_id)
+    if not pid:
+        return None, False
+    p = C.call("res.partner", "read", [pid], fields=["email"])
+    has_email = bool(p and (p[0].get("email") or "").strip())
+    return pid, has_email
+
+
+def ensure_detailer_attendee(event_id, resource_id):
+    """Attach the detailer contact as a calendar attendee (idempotent, self-healing).
+    Makes the booking show on the main calendar + colour by detailer. Re-runs safely: only
+    writes if the detailer is currently missing, so a later run repairs any strip (manual
+    edit, or a residual reap if the contact's email was blank at create time). Warns loudly
+    when the detailer contact has no email, because Odoo will then reap it ~80s later."""
+    pid, has_email = detailer_partner_for(resource_id)
+    if not pid:
+        return
+    if not has_email:
+        log(f"      WARNING: detailer contact {pid} (resource {resource_id}) has NO email "
+            f"-> Odoo reaps emailless attendees ~80s later and the detailer colour vanishes. "
+            f"Set an email on that contact to fix the colour.")
+    cur = C.call("calendar.event", "read", [event_id], fields=["partner_ids"])
+    if not cur:
+        log(f"      WARNING: event {event_id} not readable -> detailer colour self-heal "
+            f"skipped (event may have been deleted).")
+        return
+    if pid not in cur[0]["partner_ids"]:
+        if ARGS.dry_run:
+            vlog(f"[dry-run] would attach detailer {pid} to event {event_id}")
+        else:
+            C.call("calendar.event", "write", [event_id],
+                   {"partner_ids": [(4, pid)]}, context=NOISE_OFF)
+            vlog(f"detailer {pid} attached to event {event_id}")
 
 
 def parse_sdbk1(raw):
@@ -314,14 +373,18 @@ def is_paid(order):
 def is_eligible(order):
     """Confirmed-booking gate + optional --since / --only-order filters.
 
-    draft = abandoned cart (excluded). sent = completed checkout -> eligible ONLY if a
-    payment.transaction exists (excludes a bare emailed quote). sale/done = paid.
+    The shop takes bank-transfer / cash-on-the-day, so a genuine booking often stays in
+    state 'sent' (awaiting payment) rather than 'sale'. We WANT those on the calendar as
+    AWAITING PAYMENT (owner's Phase-2 decision). But a 'sent' order can also be a bare
+    emailed quote or a FAILED-card abandonment, and an unattended cron that emails the
+    customer must never act on those. So 'sent' is eligible ONLY when it carries a payment
+    intent that is not failed/cancelled (a pending bank-transfer / authorized / done tx).
+      draft = abandoned cart (excluded). sale/done = paid. sent = awaiting a live payment.
     """
     st = order.get("state")
     if st not in CONFIRMED_STATES:
         return False, f"state={st} (not a confirmed booking)"
-    if st == "sent" and not order.get("transaction_ids"):
-        return False, "sent quote with no checkout/payment attempt (abandoned)"
+    # Cheap local filters FIRST -> skip the payment.transaction RPC for excluded orders.
     if ARGS.since:
         do = (order.get("date_order") or "")[:10]
         if do and do < ARGS.since:
@@ -330,6 +393,18 @@ def is_eligible(order):
         want = ARGS.only_order.strip()
         if want != order["name"] and want != str(order["id"]):
             return False, "excluded by --only-order"
+    if st == "sent":
+        txids = order.get("transaction_ids") or []
+        if not txids:
+            return False, "sent quote with no checkout/payment attempt (abandoned)"
+        # transaction_ids includes FAILED/CANCELLED attempts; existence != booking. Require
+        # at least one tx that isn't in a dead state (a live bank-transfer/COD intent = a
+        # real booking awaiting payment; error/cancel only = a failed-card abandonment).
+        txs = C.call("payment.transaction", "search_read",
+                     [["id", "in", txids]], fields=["state"])
+        live = [t for t in txs if (t.get("state") or "") not in ("cancel", "error")]
+        if not live:
+            return False, "sent quote: all payment attempts failed/cancelled (abandoned)"
     return True, "ok"
 
 
@@ -344,7 +419,9 @@ def already_synced(order, line_id, booker_partner_id, start_utc, appt_type_id):
     2. BOUNDED per-line marker (full HTML comment) in the event description.
     3. Natural key (booker partner + exact start + appointment type).
     """
-    # 1. order-ref token (cheap, no RPC)
+    # 1. order-ref token (cheap, one existence check). The token can outlive its event if
+    #    someone deletes the event in the backend -> verify the id still exists, else fall
+    #    through to re-create (otherwise every run would error writing to a ghost id).
     ref = order.get("client_order_ref") or ""
     tok_prefix = f"SDCAL:L{line_id}=E"
     idx = ref.find(tok_prefix)
@@ -357,7 +434,9 @@ def already_synced(order, line_id, booker_partner_id, start_utc, appt_type_id):
             else:
                 break
         if num:
-            return int(num)
+            if C.call("calendar.event", "search", [["id", "=", int(num)]], limit=1):
+                return int(num)
+            vlog(f"L{line_id}: order-ref token points to deleted event {num} -> re-create")
 
     # 2. BOUNDED marker search (full comment -> no L12/L123 collision)
     marker = MARKER_COMMENT.format(line_id=line_id)
@@ -366,14 +445,22 @@ def already_synced(order, line_id, booker_partner_id, start_utc, appt_type_id):
     if hit:
         return hit[0]
 
-    # 3. natural-key fallback
+    # 3. natural-key fallback (booker + exact start + type). NOT line-scoped, so guard
+    #    against collapsing a DIFFERENT line's event into this one (two vehicles on one
+    #    order sharing booker+start+type): if the candidate already carries another line's
+    #    bounded marker, it's not ours -> fall through to create this line its own event.
     if booker_partner_id:
         hit = C.call("calendar.event", "search",
                      [["appointment_booker_id", "=", booker_partner_id],
                       ["start", "=", start_utc],
                       ["appointment_type_id", "=", appt_type_id]], limit=1)
         if hit:
-            return hit[0]
+            cand = C.call("calendar.event", "read", [hit[0]], fields=["description"])
+            cdesc = (cand[0].get("description") if cand else "") or ""
+            other = "<!-- SDBK1:L" in cdesc and marker not in cdesc
+            if not other:
+                return hit[0]
+            vlog(f"L{line_id}: natural-key hit {hit[0]} belongs to another line -> create own")
     return None
 
 
@@ -467,19 +554,26 @@ def process(rec, writer):
     # --- Idempotency: already synced? ---
     existing = already_synced(order, lid, booker_id, start_utc, sdbk["appt_type_id"])
     if existing:
+        # Self-heal the detailer colour: re-attach the detailer participant if anything
+        # stripped it since last run (manual edit, or an emailless-attendee reap). Idempotent
+        # -- only writes when actually missing.
+        ensure_detailer_attendee(existing, resource_id)
         # Refresh PAID/AWAITING status if the order moved on (e.g. sent -> sale after
         # the bank transfer cleared). No re-email; just update the event body.
         want = PST_MARKER.format(state=order.get("state"))
         ev = C.call("calendar.event", "read", [existing], fields=["description"])
         desc = (ev[0].get("description") if ev else "") or ""
         if want not in desc:
-            if not ARGS.dry_run:
-                # paid status now lives in the TITLE (✅ tick), so refresh the title + body
-                C.call("calendar.event", "write", [existing],
-                       {"name": tile_title(sdbk, order, resource_name),
-                        "description": build_description(sdbk, resource_name, lid, order)},
-                       context=NOISE_OFF)
             newstat = "PAID" if is_paid(order) else "AWAITING"
+            if ARGS.dry_run:
+                log(f"  {oname} L{lid}: event {existing} status -> {newstat} (would-update)")
+                writer.writerow([_now(), oname, lid, "would-update", existing, f"state={order.get('state')}"])
+                return "would-update"
+            # paid status now lives in the TITLE (✅ tick), so refresh the title + body
+            C.call("calendar.event", "write", [existing],
+                   {"name": tile_title(sdbk, order, resource_name),
+                    "description": build_description(sdbk, resource_name, lid, order)},
+                   context=NOISE_OFF)
             log(f"  {oname} L{lid}: event {existing} status -> {newstat} (updated)")
             writer.writerow([_now(), oname, lid, "updated", existing, f"state={order.get('state')}"])
             return "updated"
@@ -529,7 +623,11 @@ def process(rec, writer):
             booker_mobile = (pinfo[0].get("phone") or "").strip()
 
     # --- Alarms: base always; SMS only with --with-sms AND a mobile, AND not past ---
+    # --no-email means NO mail at all -> also drop the event-level Email alarm (id 6), else
+    # a 'safe test' future booking still emails booker + detailer at T-3h.
     alarms = list(BASE_ALARMS)
+    if ARGS.no_email:
+        alarms = [a for a in alarms if a != EMAIL_ALARM]
     if ARGS.with_sms and booker_mobile and not is_past:
         alarms.append(SMS_ALARM)
 
@@ -538,6 +636,16 @@ def process(rec, writer):
         f"type={sdbk['appt_type_id']} resource={resource_id}:{resource_name} "
         f"booker={booker_id}:{partner_name} email={booker_email or '(none)'} "
         f"alarms={alarms} past={is_past} src={rec['source']}")
+
+    # --- Creation cap (--max): applies ONLY to would-be creations. Already-synced lines
+    #     returned skip/update above and are never throttled, so colour self-heal + status
+    #     refresh always run. Counted in dry-run too, so a --max preview matches --commit. ---
+    global _CREATED
+    if ARGS.max and _CREATED >= ARGS.max:
+        log(f"  {oname} L{lid}: --max {ARGS.max} reached -- deferred to next run")
+        writer.writerow([_now(), oname, lid, "deferred", "", f"--max {ARGS.max} reached"])
+        return "deferred"
+    _CREATED += 1
 
     if ARGS.dry_run:
         log("      DRY-RUN -- would create calendar.event"
@@ -580,15 +688,12 @@ def process(rec, writer):
     log(f"      created calendar.event {event_id}")
 
     # The appointment create strips partner_ids to the booker, so add the DETAILER contact
-    # (Alex/Kade) as a participant via a follow-up write (verified to stick). This makes the
-    # detailer BOTH the resource (lanes/availability) AND a participant -> the booking shows
-    # on the main Meetings calendar (which only surfaces events whose participants you've
-    # ticked) AND auto-colours by detailer (the calendar colours by participant). Contacts,
-    # not Odoo user accounts -> no paid seats.
-    _detailer_partner = RESOURCE_PARTNER.get(resource_id)
-    if _detailer_partner:
-        C.call("calendar.event", "write", [event_id],
-               {"partner_ids": [(4, _detailer_partner)]}, context=NOISE_OFF)
+    # (Alex/Kade) as a participant. This makes the detailer BOTH the resource (lanes/
+    # availability) AND a participant -> the booking shows on the main Meetings calendar and
+    # auto-colours by detailer. REQUIRES the detailer contact to have an email (else Odoo
+    # reaps it ~80s later); ensure_detailer_attendee() warns if it doesn't. Contacts, not
+    # Odoo user accounts -> no paid seats.
+    ensure_detailer_attendee(event_id, resource_id)
 
     # --- Order-level audit token ---
     append_order_marker(order, lid, event_id)
@@ -610,13 +715,18 @@ def process(rec, writer):
                      [["event_id", "=", event_id], ["partner_id", "=", booker_id]], limit=1)
         if att:
             try:
+                # force_send=False -> queue via mail.mail. If the SaaS daily email cap is hit
+                # mid-backfill the message stays 'outgoing' and Odoo's mail cron RETRIES it
+                # automatically (force_send=True would raise synchronously and the confirmation
+                # would be lost forever, since a re-run finds the event already synced and
+                # never re-attempts the send).
                 C.call("mail.template", "send_mail", [BOOKED_TEMPLATE], att[0],
-                       force_send=True)
-                mailed = f"emailed att{att[0]}"
-                log(f"      sent template {BOOKED_TEMPLATE} to attendee {att[0]} <{booker_email}>")
+                       force_send=False)
+                mailed = f"queued att{att[0]}"
+                log(f"      queued template {BOOKED_TEMPLATE} to attendee {att[0]} <{booker_email}>")
             except Exception as e:
                 mailed = f"email-failed: {e}"
-                log(f"      WARNING: template {BOOKED_TEMPLATE} send failed: {e}")
+                log(f"      WARNING: template {BOOKED_TEMPLATE} queue failed: {e}")
         else:
             mailed = "no-attendee"
             log("      WARNING: no calendar.attendee found -- email skipped")
@@ -631,8 +741,55 @@ def _now():
 
 
 # ---------------------------------------------------------------------------
+# Single-instance lock: search-before-create is not atomic over RPC, so two overlapping
+# runs (a manual --commit backfill firing while the scheduled cron runs, or two scheduled
+# runs) could BOTH see a line as unsynced and both create the event + both send template 37.
+# A cross-platform O_EXCL lock file prevents that. A stale lock (crashed run) is stolen.
+# ---------------------------------------------------------------------------
+LOCK_PATH = Path(__file__).resolve().parent / ".sync_bookings.lock"
+LOCK_STALE_SECONDS = 1800   # 30 min -> assume the holder crashed and reclaim
+
+
+def acquire_lock():
+    # At most ONE steal attempt -> never recurse unboundedly if a stale lock is undeletable.
+    for _ in range(2):
+        try:
+            fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{os.getpid()} {_now()}".encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                age = time.time() - LOCK_PATH.stat().st_mtime
+            except OSError:
+                age = 0
+            if age <= LOCK_STALE_SECONDS:
+                return False            # held by a live run
+            log(f"    lock {LOCK_PATH.name} is stale ({int(age)}s old) -- stealing it")
+            try:
+                LOCK_PATH.unlink()
+            except OSError:
+                return False            # can't steal (perms / open handle) -> give up, no recursion
+            # loop once more to re-create; if we lose the create race, the retry returns False
+    return False
+
+
+def release_lock():
+    # Only unlink OUR lock: if a long run's lock was stolen (age > stale) by a newer run,
+    # the file now belongs to the stealer -> deleting it would drop live mutual exclusion.
+    try:
+        if LOCK_PATH.exists():
+            owner = LOCK_PATH.read_text().split(" ", 1)[0]
+            if owner == str(os.getpid()):
+                LOCK_PATH.unlink()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 def main():
-    global C, ARGS, _RESOURCES, _APPT_TYPES
+    global C, ARGS, _RESOURCES, _APPT_TYPES, _CREATED
+    _CREATED = 0
     ap = argparse.ArgumentParser(description="Sync custom-cart bookings to Odoo Appointments")
     ap.add_argument("--commit", action="store_true",
                     help="actually create events + send email (default is dry-run)")
@@ -642,16 +799,15 @@ def main():
                     help="also schedule the SMS reminder (alarm 8) when the booker has a mobile")
     ap.add_argument("--include-past", action="store_true",
                     help="create events for past-dated bookings (event only, no email/sms)")
-    ap.add_argument("--include-sent", action="store_true",
-                    help="ALSO act on unpaid 'sent' quotations (NOT recommended; loud warning)")
     ap.add_argument("--allow-overlap", action="store_true",
                     help="create even if the slot overlaps an existing event on the same resource")
     ap.add_argument("--only-order", default=None,
                     help="restrict to one order (name like S00088 or numeric id)")
     ap.add_argument("--since", default=None,
                     help="only orders with date_order >= YYYY-MM-DD")
-    ap.add_argument("--max", type=int, default=0,
-                    help="cap creations this run (throttle the first backfill under the email cap); 0=unlimited")
+    ap.add_argument("--max", type=int, default=25,
+                    help="cap (would-)creations this run so a naive --commit self-throttles under "
+                         "the SaaS daily email cap; re-run to continue. Pass --max 0 for unlimited.")
     ap.add_argument("--verbose", action="store_true")
     ARGS = ap.parse_args()
     ARGS.dry_run = not ARGS.commit   # dry-run is the DEFAULT
@@ -659,6 +815,19 @@ def main():
     mode = "LIVE" if ARGS.commit else "DRY-RUN"
     log(f"=== SD booking sync [{mode}] {_now()} NZ ===")
 
+    # Single-instance guard (only a real write run needs it; a dry-run makes no changes).
+    if ARGS.commit and not acquire_lock():
+        log(f"    another sync run holds {LOCK_PATH.name} -- exiting (not an error).")
+        return
+    try:
+        _run(mode)
+    finally:
+        if ARGS.commit:
+            release_lock()
+
+
+def _run(mode):
+    global C, _RESOURCES, _APPT_TYPES
     C = OdooClient()
     log(f"    connected uid={C.uid} db={C.db}  confirmed-states={CONFIRMED_STATES} "
         f"(sent needs a payment tx)  email={'OFF' if ARGS.no_email else 'ON'}  "
@@ -670,6 +839,26 @@ def main():
                    C.call("appointment.type", "search_read", [], fields=["id"])}
     log(f"    resources: {_RESOURCES}")
 
+    # Detailer-contact email preflight: an emailless detailer contact gets reaped from the
+    # attendee list ~80s after each event write, so the colour vanishes and every run churns
+    # a futile re-attach. Under --commit this is a HARD STOP (re-attaching is pointless until
+    # the email exists); a dry-run only warns so it can still preview. Rule 7: no silent skip.
+    _missing = []
+    for _rid, _pid in RESOURCE_PARTNER.items():
+        _p = C.call("res.partner", "read", [_pid], fields=["name", "email"])
+        _em = (_p[0].get("email") or "").strip() if _p else ""
+        if _em:
+            log(f"    detailer contact res{_rid} -> {_p[0]['name']} <{_em}> (colour OK)")
+        else:
+            _missing.append((_rid, _pid))
+            log(f"    *** WARNING: detailer contact res{_rid} (partner {_pid}) has NO EMAIL "
+                f"-> its calendar colour will be reaped ~80s after each sync. Set an email.")
+    if _missing and ARGS.commit:
+        log(f"    ABORT: {len(_missing)} detailer contact(s) have no email; a --commit run "
+            f"would churn futile re-attaches. Set the email(s) and re-run. (partners "
+            f"{[p for _, p in _missing]})")
+        sys.exit(2)
+
     # Timestamped CSV log
     logdir = Path(__file__).resolve().parent / "logs"
     logdir.mkdir(exist_ok=True)
@@ -678,30 +867,27 @@ def main():
     records = discover_bookings()
     log(f"    discovered {len(records)} SDBK1 line(s)")
 
-    counts = {"created": 0, "would-create": 0, "updated": 0, "skip": 0,
-              "conflict": 0, "error": 0, "ineligible": 0}
-    created_this_run = 0
+    counts = {"created": 0, "would-create": 0, "updated": 0, "would-update": 0,
+              "skip": 0, "conflict": 0, "error": 0, "ineligible": 0, "deferred": 0}
+    # NB: the --max cap is enforced INSIDE process() (right before a create), so already-
+    # synced lines still self-heal the colour + refresh status regardless of the cap.
     with open(logpath, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(["ts", "order", "line_id", "action", "event_id", "detail"])
         for rec in records:
-            ok, why = is_eligible(rec["order"])
-            if not ok:
-                vlog(f"    {rec['order']['name']} L{rec['line']['id']} ineligible: {why}")
-                writer.writerow([_now(), rec["order"]["name"], rec["line"]["id"],
-                                 "ineligible", "", why])
-                counts["ineligible"] += 1
-                continue
-            if ARGS.max and created_this_run >= ARGS.max:
-                log(f"    --max {ARGS.max} reached -- stopping (remaining lines deferred to next run)")
-                writer.writerow([_now(), rec["order"]["name"], rec["line"]["id"],
-                                 "deferred", "", f"--max {ARGS.max} reached"])
-                continue
+            # is_eligible() now issues an RPC (payment.transaction) for 'sent' orders, so it
+            # lives INSIDE the try -> one bad/permission-denied order is logged + skipped, it
+            # never aborts the whole run.
             try:
+                ok, why = is_eligible(rec["order"])
+                if not ok:
+                    vlog(f"    {rec['order']['name']} L{rec['line']['id']} ineligible: {why}")
+                    writer.writerow([_now(), rec["order"]["name"], rec["line"]["id"],
+                                     "ineligible", "", why])
+                    counts["ineligible"] += 1
+                    continue
                 outcome = process(rec, writer)
                 counts[outcome] = counts.get(outcome, 0) + 1
-                if outcome == "created":
-                    created_this_run += 1
             except Exception as e:
                 counts["error"] += 1
                 log(f"    ERROR {rec['order']['name']} L{rec['line']['id']}: {type(e).__name__}: {e}")
@@ -709,8 +895,11 @@ def main():
                                  "error", "", f"{type(e).__name__}: {e}"])
 
     log(f"=== done [{mode}] created={counts['created']} would-create={counts['would-create']} "
-        f"updated={counts['updated']} skip={counts['skip']} conflict={counts['conflict']} "
+        f"updated={counts['updated']} would-update={counts['would-update']} "
+        f"deferred={counts['deferred']} skip={counts['skip']} conflict={counts['conflict']} "
         f"ineligible={counts['ineligible']} error={counts['error']} ===")
+    if counts["deferred"]:
+        log(f"    NOTE: {counts['deferred']} line(s) deferred by --max {ARGS.max}; re-run to continue.")
     log(f"    log: {logpath}")
     if counts["error"]:
         sys.exit(1)
