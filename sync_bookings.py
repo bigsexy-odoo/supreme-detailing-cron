@@ -97,7 +97,13 @@ RESOURCE_TAG = {1: 1, 2: 2}   # appointment.resource id -> calendar.event.type (
 # The Meetings calendar colours by ATTENDEE, so add the detailer as a calendar attendee
 # whose partner carries a preset colour (Alex=green/10, Kade=red/1). One-time owner step:
 # in Calendar sidebar '+ Add Attendees' -> tick Alex + Kade to colour/filter bookings by detailer.
-RESOURCE_PARTNER = {1: 69, 2: 70}   # appointment.resource id -> detailer res.partner id
+RESOURCE_PARTNER = {1: 69, 2: 70}   # appointment.resource id -> detailer res.partner id (unused in Option B)
+# OPTION B: the Meetings calendar colours by ATTENDEE, so colour by PAID STATUS via a
+# status partner attendee (Paid=green / Awaiting=red). Detailer is shown by an A/K letter
+# in the title. One-time owner step: in Calendar sidebar tick '✅ Paid' (green swatch) +
+# '⏳ Awaiting Payment' (red swatch); untick everything else. Filtering to Awaiting = a
+# ready-made "who still owes me" view.
+STATUS_PARTNER = {True: 71, False: 72}   # is_paid -> res.partner (✅ Paid green / ⏳ Awaiting red)
 NZ = ZoneInfo("Pacific/Auckland")   # DST-correct: NZST=UTC+12, NZDT=UTC+13
 UTC = ZoneInfo("UTC")
 
@@ -441,7 +447,10 @@ def process(rec, writer):
         if want not in desc:
             if not ARGS.dry_run:
                 C.call("calendar.event", "write", [existing],
-                       {"description": build_description(sdbk, resource_name, lid, order)},
+                       {"description": build_description(sdbk, resource_name, lid, order),
+                        # flip the colour: drop the old status partner, add the new one
+                        "partner_ids": [(3, STATUS_PARTNER[not is_paid(order)]),
+                                        (4, STATUS_PARTNER[is_paid(order)])]},
                        context=NOISE_OFF)
             newstat = "PAID" if is_paid(order) else "AWAITING"
             log(f"  {oname} L{lid}: event {existing} status -> {newstat} (updated)")
@@ -478,11 +487,10 @@ def process(rec, writer):
 
     # Tile-friendly title: paid marker + customer + short service + suburb (time shows
     # automatically on the calendar tile; detailer shows via colour/description).
-    _cust = (partner_name or "").split(" - ")[0].strip()
-    _cust_short = (_cust.split()[0] if _cust else "") or "Booking"
     _svc_short = sdbk["service_label"].replace(" Package", "").split(" (")[0].strip()
-    _paid = "✅" if is_paid(order) else "⏳"   # ✅ paid / ⏳ awaiting
-    ename = f"{_paid} {_cust_short} · {_svc_short} · {sdbk['suburb']}"
+    _ini = (resource_name[:1] or "?").upper()   # A (Alex) / K (Kade) — detailer at a glance
+    # Colour carries paid status (Option B), so the letter+service+suburb is the tile text.
+    ename = f"{_ini} · {_svc_short} · {sdbk['suburb']}"
     location = f"{sdbk['suburb']}, Auckland" if sdbk["suburb"] else "Auckland"
 
     # --- Email eligibility (present address + future + not --no-email) ---
@@ -525,8 +533,9 @@ def process(rec, writer):
         # Attendees = the customer AND the org partner, so the booking shows on the
         # single Supreme Detailing calendar (Odoo Calendar filters to "my" attendees;
         # detailer separation is via appointment_resource_ids + the description).
+        # Colour-by-paid: the status partner (green/red) + the customer (for the email).
         "partner_ids": [(6, 0, list(dict.fromkeys(
-            [p for p in [ORGANIZER_PARTNER, RESOURCE_PARTNER.get(resource_id), booker_id] if p])))],
+            [p for p in [STATUS_PARTNER[is_paid(order)], booker_id] if p])))],
         "appointment_booker_id": booker_id,
         "appointment_type_id": sdbk["appt_type_id"],
         # Assign the detailer via a booking line (carries capacity) -- NOT the m2m
