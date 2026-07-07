@@ -17,10 +17,10 @@ from pathlib import Path
 from odoo_client import OdooClient, cfg
 import reviews_common as rc
 
-RIBBON_VIEW = 3497    # website.sd_nav_testimonial  (top band, every page)
-CAROUSEL_VIEW = 585   # website.homepage #reviews s_quotes  (big testimonial block)
-RIBBON_MS = 5000      # top ribbon rotator: 5s
-CAROUSEL_MS = 10000   # bottom carousel: 10s (more text, slower)
+RIBBON_VIEW = 3497       # website.sd_nav_testimonial  (top band, every page)
+CAROUSEL_VIEWS = [585, 2388]  # homepage #reviews + Services page s_quotes carousels
+RIBBON_MS = 5000         # top ribbon rotator: 5s
+CAROUSEL_MS = 10000      # carousels: 10s (more text, slower)
 
 
 def main() -> int:
@@ -75,8 +75,9 @@ def main() -> int:
 
     refresh(RIBBON_VIEW, "ribbon",
             lambda a: rc.update_ribbon_arch(a, reviews, interval_ms=RIBBON_MS))
-    refresh(CAROUSEL_VIEW, "carousel",
-            lambda a: rc.update_carousel_arch(a, reviews, interval=CAROUSEL_MS))
+    for vid in CAROUSEL_VIEWS:
+        refresh(vid, f"carousel-{vid}",
+                lambda a: rc.update_carousel_arch(a, reviews, interval=CAROUSEL_MS))
     return 0
 
 
