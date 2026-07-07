@@ -91,6 +91,9 @@ ORGANIZER_USER = 2          # user_id on event 2. NOTE: appointment.resource car
 BASE_ALARMS = [3, 6]        # Notification 1h + Email 3h. SMS (id 8) added only with --with-sms.
 SMS_ALARM = 8               # "SMS Text Message - 1 Hours" -- real IAP credits, off by default.
 BOOKED_TEMPLATE = 37        # mail.template "Appointment: Attendee Invitation" (model calendar.attendee)
+# Calendar colour tags (calendar.event.type): North Shore/Alex=green, Central/Kade=red.
+# Only shows if the Meetings calendar (view 2430) colours by categ_ids (set up separately).
+RESOURCE_TAG = {1: 1, 2: 2}   # appointment.resource id -> calendar.event.type (tag) id
 NZ = ZoneInfo("Pacific/Auckland")   # DST-correct: NZST=UTC+12, NZDT=UTC+13
 UTC = ZoneInfo("UTC")
 
@@ -530,6 +533,8 @@ def process(rec, writer):
         })],
         "alarm_ids": [(6, 0, alarms)],
         "appointment_status": "booked",
+        # colour tag by detailer (green North Shore / red Central)
+        "categ_ids": [(6, 0, [RESOURCE_TAG[resource_id]])] if resource_id in RESOURCE_TAG else [],
         "location": location,
         "description": build_description(sdbk, resource_name, lid, order),
     }
