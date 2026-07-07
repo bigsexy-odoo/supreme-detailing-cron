@@ -98,8 +98,13 @@ SYNC_TAG = "[SD-booking-sync]"                    # visible provenance line in t
 MARKER_COMMENT = "<!-- SDBK1:L{line_id} -->"      # BOUNDED per-line idempotency key (full comment)
 ORDER_TOKEN = "SDCAL:L{line_id}=E{event_id}"      # order-ref audit token
 
-# Default paid/confirmed gate. 'sent' is UNPAID here and is opt-in via --include-sent.
-DEFAULT_STATES = ["sale", "done"]
+# A "confirmed booking" = the customer completed checkout. For a bank-transfer / COD
+# shop that is state 'sent' WITH a payment.transaction (a bare emailed quote / abandoned
+# cart has none), plus 'sale'/'done' (owner-confirmed = paid). ALL confirmed bookings go
+# on the calendar; the event shows PAID vs AWAITING so the detailer knows before the day.
+CONFIRMED_STATES = ["sent", "sale", "done"]
+PAID_STATES = ["sale", "done"]
+PST_MARKER = "<!-- PST:{state} -->"   # payment-state marker -> lets a re-run refresh status
 
 # Suppress ALL mail/log noise on the create; we send template 37 explicitly afterwards.
 # `no_mail_to_attendees` stops Odoo's generic .ics calendar invite so we don't double-mail.
@@ -240,7 +245,7 @@ def discover_bookings():
     order_ids = sorted({ln["order_id"][0] for ln in lines if ln.get("order_id")})
     orders = C.call("sale.order", "read", order_ids,
                     fields=["id", "name", "state", "partner_id", "client_order_ref",
-                            "date_order", "website_id"])
+                            "date_order", "website_id", "amount_total", "transaction_ids"])
     order_map = {o["id"]: o for o in orders}
 
     records = []
@@ -261,18 +266,21 @@ def discover_bookings():
     return records
 
 
-def eligible_states():
-    states = list(DEFAULT_STATES)
-    if ARGS.include_sent:
-        states.append("sent")
-    return states
+def is_paid(order):
+    return order.get("state") in PAID_STATES
 
 
 def is_eligible(order):
-    """State gate + optional --since / --only-order filters."""
-    states = eligible_states()
-    if order["state"] not in states:
-        return False, f"state={order['state']} (need one of {states})"
+    """Confirmed-booking gate + optional --since / --only-order filters.
+
+    draft = abandoned cart (excluded). sent = completed checkout -> eligible ONLY if a
+    payment.transaction exists (excludes a bare emailed quote). sale/done = paid.
+    """
+    st = order.get("state")
+    if st not in CONFIRMED_STATES:
+        return False, f"state={st} (not a confirmed booking)"
+    if st == "sent" and not order.get("transaction_ids"):
+        return False, "sent quote with no checkout/payment attempt (abandoned)"
     if ARGS.since:
         do = (order.get("date_order") or "")[:10]
         if do and do < ARGS.since:
@@ -336,21 +344,32 @@ def slot_conflict(resource_id, start_utc, stop_utc):
     return C.call("calendar.event", "search", dom)
 
 
-def build_description(sdbk, resource_name, line_id):
+def build_description(sdbk, resource_name, line_id, order):
     """Human-readable event body + the hidden BOUNDED per-line idempotency marker.
 
     Kept non-empty on purpose so enrich_calendar_events.py leaves it alone
     (that script only fills events whose description is empty) -- the marker
     therefore never gets clobbered in normal (non --force) operation.
+
+    The order line makes the PAID status visible on the calendar: this event only
+    exists because the order reached a paid/confirmed state (sale/done -> the eligibility
+    gate), and the order number + total let a detailer cross-check payment in one click.
     """
+    paid = ("PAID ✅" if is_paid(order)
+            else "AWAITING PAYMENT ⏳ (bank transfer / cash on day)")
+    amt = order.get("amount_total")
+    amt_str = f" · ${amt:.2f} NZD" if amt else ""
     lines = [
+        f"\U0001f4b3 {paid}",
         f"\U0001f697 Service: {sdbk['service_label']}",
         f"\U0001f4cd Suburb: {sdbk['suburb']}",
         f"\U0001f464 Detailer: {resource_name}",
         f"\U0001f550 {sdbk['date']} {sdbk['time24']} ({sdbk['duration']}h) NZ",
+        f"\U0001f9fe Order {order.get('name')}{amt_str}",
         "",
         SYNC_TAG,
         MARKER_COMMENT.format(line_id=line_id),
+        PST_MARKER.format(state=order.get("state")),
     ]
     return "<br/>\n".join(lines)
 
@@ -407,7 +426,21 @@ def process(rec, writer):
     # --- Idempotency: already synced? ---
     existing = already_synced(order, lid, booker_id, start_utc, sdbk["appt_type_id"])
     if existing:
-        log(f"  {oname} L{lid}: already synced -> event {existing} -- skip")
+        # Refresh PAID/AWAITING status if the order moved on (e.g. sent -> sale after
+        # the bank transfer cleared). No re-email; just update the event body.
+        want = PST_MARKER.format(state=order.get("state"))
+        ev = C.call("calendar.event", "read", [existing], fields=["description"])
+        desc = (ev[0].get("description") if ev else "") or ""
+        if want not in desc:
+            if not ARGS.dry_run:
+                C.call("calendar.event", "write", [existing],
+                       {"description": build_description(sdbk, resource_name, lid, order)},
+                       context=NOISE_OFF)
+            newstat = "PAID" if is_paid(order) else "AWAITING"
+            log(f"  {oname} L{lid}: event {existing} status -> {newstat} (updated)")
+            writer.writerow([_now(), oname, lid, "updated", existing, f"state={order.get('state')}"])
+            return "updated"
+        log(f"  {oname} L{lid}: already synced -> event {existing} (status current) -- skip")
         writer.writerow([_now(), oname, lid, "skip", existing, "already synced"])
         return "skip"
 
@@ -489,7 +522,7 @@ def process(rec, writer):
         "alarm_ids": [(6, 0, alarms)],
         "appointment_status": "booked",
         "location": location,
-        "description": build_description(sdbk, resource_name, lid),
+        "description": build_description(sdbk, resource_name, lid, order),
     }
     event_id = C.call("calendar.event", "create", vals, context=NOISE_OFF)
     if isinstance(event_id, (list, tuple)):
@@ -564,13 +597,11 @@ def main():
 
     mode = "LIVE" if ARGS.commit else "DRY-RUN"
     log(f"=== SD booking sync [{mode}] {_now()} NZ ===")
-    if ARGS.include_sent:
-        log("    !! --include-sent: acting on UNPAID 'sent' quotations too -- "
-            "customers may be emailed a booking for a slot they never paid for.")
 
     C = OdooClient()
-    log(f"    connected uid={C.uid} db={C.db}  states={eligible_states()}  "
-        f"email={'OFF' if ARGS.no_email else 'ON'}  sms={'ON' if ARGS.with_sms else 'OFF'}")
+    log(f"    connected uid={C.uid} db={C.db}  confirmed-states={CONFIRMED_STATES} "
+        f"(sent needs a payment tx)  email={'OFF' if ARGS.no_email else 'ON'}  "
+        f"sms={'ON' if ARGS.with_sms else 'OFF'}")
 
     _RESOURCES = {r["id"]: r["name"] for r in
                   C.call("appointment.resource", "search_read", [], fields=["id", "name"])}
@@ -586,8 +617,8 @@ def main():
     records = discover_bookings()
     log(f"    discovered {len(records)} SDBK1 line(s)")
 
-    counts = {"created": 0, "would-create": 0, "skip": 0, "conflict": 0,
-              "error": 0, "ineligible": 0}
+    counts = {"created": 0, "would-create": 0, "updated": 0, "skip": 0,
+              "conflict": 0, "error": 0, "ineligible": 0}
     created_this_run = 0
     with open(logpath, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
@@ -617,7 +648,7 @@ def main():
                                  "error", "", f"{type(e).__name__}: {e}"])
 
     log(f"=== done [{mode}] created={counts['created']} would-create={counts['would-create']} "
-        f"skip={counts['skip']} conflict={counts['conflict']} "
+        f"updated={counts['updated']} skip={counts['skip']} conflict={counts['conflict']} "
         f"ineligible={counts['ineligible']} error={counts['error']} ===")
     log(f"    log: {logpath}")
     if counts["error"]:
