@@ -4,7 +4,7 @@
 /* Testimonial announcement bar above nav */
 .sd-testimonial-bar {
     display: block;
-    background: #F5F5F5;
+    background: linear-gradient(90deg, #51344D, #0B020A);
     border-bottom: 1px solid rgba(0,0,0,0.05);
     text-align: center;
     height: 28px;
@@ -41,11 +41,11 @@
     font-size: 0.65rem;
 }
 .sd-testimonial-bar em {
-    color: #737373;
+    color: #F5F2F0;
     font-style: italic;
 }
 .sd-testimonial-bar strong {
-    color: #525252;
+    color: #FFFFFF;
     font-weight: 600;
     margin-left: 4px;
     font-size: 0.7rem;
@@ -75,10 +75,10 @@ html.o_connected_user .sd-testimonial-bar {
     if (document.querySelector('html').classList.contains('o_connected_user')) return;
     var quotes = [
         {text: "We use Supreme Detailing to detail our employees’ cars as a reward for hitting our team…", author: "Stephen Karena", date: "Jul 2026"},
-        {text: "Great young lads. They made my car look brand new again. Would definitely recommend them.", author: "Hunter Hosken", date: "Jul 2026"},
         {text: "Used this service for washing and detailing a well used rental car while visiting. Alex…", author: "Bruce Thomson", date: "Jul 2026"},
         {text: "Fantastic service from start to finish. My car came back looking immaculate, with great…", author: "Ana Vulinovich", date: "Jul 2026"},
-        {text: "Alex has been detailing by car for the past 2 years. I am very happy with the quality of…", author: "Natasha MacLeod", date: "Jul 2026"}
+        {text: "Alex has been detailing by car for the past 2 years. I am very happy with the quality of…", author: "Natasha MacLeod", date: "Jul 2026"},
+        {text: "Great job done, highly Recommend, Will definitely be back so happy", author: "Danny O'Loughlin", date: "Jul 2026"}
     ];
     function buildBar(header) {
         var bar = document.createElement('div');
@@ -107,7 +107,7 @@ html.o_connected_user .sd-testimonial-bar {
             idx = (idx + 1) % items.length;
             items[idx].classList.add('active');
             setTimeout(function() { old.classList.remove('sd-exit'); }, 900);
-        }, 4000);
+        }, 5000);
         return true;
     }
     if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', function(){ var iv=setInterval(function(){ if(init()) clearInterval(iv); },200); }); } else { var iv=setInterval(function(){ if(init()) clearInterval(iv); },200); }
@@ -115,6 +115,6 @@ html.o_connected_user .sd-testimonial-bar {
         </script>
     </xpath>
 <xpath expr="//header/*[1]" position="before">
-        <div class="sd-testimonial-bar"><span class="sd-nq active"><span class="sd-stars">★★★★★</span><em>"We use Supreme Detailing to detail our employees’ cars as a reward for hitting our team…"</em><strong> — Stephen Karena, Jul 2026</strong></span><span class="sd-nq"><span class="sd-stars">★★★★★</span><em>"Great young lads. They made my car look brand new again. Would definitely recommend them."</em><strong> — Hunter Hosken, Jul 2026</strong></span><span class="sd-nq"><span class="sd-stars">★★★★★</span><em>"Used this service for washing and detailing a well used rental car while visiting. Alex…"</em><strong> — Bruce Thomson, Jul 2026</strong></span><span class="sd-nq"><span class="sd-stars">★★★★★</span><em>"Fantastic service from start to finish. My car came back looking immaculate, with great…"</em><strong> — Ana Vulinovich, Jul 2026</strong></span><span class="sd-nq"><span class="sd-stars">★★★★★</span><em>"Alex has been detailing by car for the past 2 years. I am very happy with the quality of…"</em><strong> — Natasha MacLeod, Jul 2026</strong></span></div>
+        <div class="sd-testimonial-bar"><span class="sd-nq active"><span class="sd-stars">★★★★★</span><em>"We use Supreme Detailing to detail our employees’ cars as a reward for hitting our team…"</em><strong> — Stephen Karena, Jul 2026</strong></span><span class="sd-nq"><span class="sd-stars">★★★★★</span><em>"Used this service for washing and detailing a well used rental car while visiting. Alex…"</em><strong> — Bruce Thomson, Jul 2026</strong></span><span class="sd-nq"><span class="sd-stars">★★★★★</span><em>"Fantastic service from start to finish. My car came back looking immaculate, with great…"</em><strong> — Ana Vulinovich, Jul 2026</strong></span><span class="sd-nq"><span class="sd-stars">★★★★★</span><em>"Alex has been detailing by car for the past 2 years. I am very happy with the quality of…"</em><strong> — Natasha MacLeod, Jul 2026</strong></span><span class="sd-nq"><span class="sd-stars">★★★★★</span><em>"Great job done, highly Recommend, Will definitely be back so happy"</em><strong> — Danny O'Loughlin, Jul 2026</strong></span></div>
     </xpath>
 </data>

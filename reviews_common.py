@@ -149,8 +149,9 @@ _BLOCKQUOTE_CLS = ("s_blockquote s_blockquote_with_icon o_cc o_animable position
                    "d-flex flex-column gap-4 w-50 mx-auto p-5 fst-normal o_cc2 o_colored_level")
 
 
-def carousel_snippet(text: str, limit: int = 320) -> str:
-    """Full-ish review text for a testimonial slide; capped so a slide stays sane."""
+def carousel_snippet(text: str, limit: int = 650) -> str:
+    """Full-ish review text for a testimonial slide; generous cap so most reviews
+    show in full, only very long ones get trimmed."""
     text = " ".join((text or "").split())
     if len(text) > limit:
         text = text[:limit].rsplit(" ", 1)[0].rstrip(",;:") + "…"
@@ -199,12 +200,14 @@ def carousel_dots(reviews, carousel_id: str, max_items: int = 6) -> str:
 _SLIDES_RE = re.compile(re.escape(SL_START) + r".*?" + re.escape(SL_END), re.DOTALL)
 _DOTS_RE = re.compile(re.escape(DOT_START) + r".*?" + re.escape(DOT_END), re.DOTALL)
 _INTERVAL_RE = re.compile(r'(s_quotes_carousel carousel[^>]*?data-bs-interval=")\d+(")')
+_RIDE_RE = re.compile(r'(s_quotes_carousel carousel[^>]*?data-bs-ride=")[^"]*(")')
 _CID_RE = re.compile(r'id="(myQuoteCarousel\d+)"')
 
 
-def update_carousel_arch(arch: str, reviews: list, interval: int = 5000) -> str:
+def update_carousel_arch(arch: str, reviews: list, interval: int = 10000) -> str:
     """Refresh the #reviews carousel slides + dots between markers, set the cycle
-    interval. Requires the one-time install to have added the markers first."""
+    interval, and ensure it AUTOPLAYS (data-bs-ride='carousel' — 'true' only cycles
+    after a manual swipe). Requires the one-time install to have added the markers."""
     m = _CID_RE.search(arch)
     if not m:
         raise RuntimeError("carousel id not found")
@@ -212,6 +215,7 @@ def update_carousel_arch(arch: str, reviews: list, interval: int = 5000) -> str:
     if SL_START not in arch or DOT_START not in arch:
         raise RuntimeError("GR carousel markers not found — run _push_reviews_carousel.py first")
     new = _INTERVAL_RE.sub(lambda mm: mm.group(1) + str(interval) + mm.group(2), arch, count=1)
+    new = _RIDE_RE.sub(lambda mm: mm.group(1) + "carousel" + mm.group(2), new, count=1)
     new = _SLIDES_RE.sub(lambda _mm: carousel_slides(reviews), new, count=1)
     new = _DOTS_RE.sub(lambda _mm: carousel_dots(reviews, cid), new, count=1)
     return clean_over_escaping(new)
