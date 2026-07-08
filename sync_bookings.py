@@ -188,11 +188,13 @@ def type_code(service_label):
 
 
 def tile_title(sdbk, order, resource_name):
-    """[✅ if paid] [A/K detailer] CODE Suburb  e.g. '✅ K SD Onehunga' or 'A EP Milford'.
-    ✅ = paid (blank = unpaid); A=Alex / K=Kade; EP/IP/SD/PO/RS = booking type."""
-    tick = "✅ " if is_paid(order) else ""
+    """[💰 if paid] [A/K detailer] CODE Suburb  e.g. '💰 K SD Onehunga' or 'A EP Milford'.
+    The Meetings calendar can't colour by detailer on a single login (Odoo colours every
+    event in the logged-in user's colour), so the A/K LETTER is the detailer signal, not
+    colour. 💰 = paid (gold, reads on any tile); blank = unpaid. EP/IP/SD/PO/RS = type."""
+    paid = "💰 " if is_paid(order) else ""
     ini = (resource_name[:1] or "").upper()   # A (Alex) / K (Kade)
-    return f"{tick}{ini} {type_code(sdbk['service_label'])} {sdbk['suburb']}"
+    return f"{paid}{ini} {type_code(sdbk['service_label'])} {sdbk['suburb']}"
 
 
 def detailer_partner_for(resource_id):
@@ -321,19 +323,27 @@ def discover_bookings():
         if v.get("sale_order_line_id"):
             cav_by_line[v["sale_order_line_id"][0]] = v["custom_value"]
 
-    # ---- Channel 2: test fallback -- SDBK1 token in the line name ----
+    # ---- Channel 2: SDBK1 token in the line NAME. Serves BOTH the manual test fallback
+    #      AND a production safety net: Odoo bakes the custom value into the line name as
+    #      "Booking: Custom: SDBK1|..." at add-to-cart, so the token survives on the name
+    #      even if the product.attribute.custom.value record is later missing. Match
+    #      "SDBK1|" ANYWHERE in the chunk (not startswith) so the "Booking: Custom: " render
+    #      prefix doesn't hide it. ----
     name_lines = C.call("sale.order.line", "search_read",
                         [["name", "ilike", "SDBK1|"]],
                         fields=["id", "name"])
-    vlog(f"discover: {len(name_lines)} lines with SDBK1 in name (test fallback)")
+    vlog(f"discover: {len(name_lines)} lines with SDBK1 in name")
     fallback_by_line = {}
     for ln in name_lines:
-        for chunk in (ln.get("name") or "").splitlines():
-            if chunk.strip().startswith("SDBK1"):
-                fallback_by_line[ln["id"]] = chunk.strip()
-                if ln["id"] not in line_ids:
-                    line_ids.append(ln["id"])
-                break
+        txt = ln.get("name") or ""
+        pos = txt.find("SDBK1|")
+        if pos == -1:
+            continue
+        # take from SDBK1 to the end of that physical line (drop any leading render prefix)
+        chunk = txt[pos:].splitlines()[0].strip()
+        fallback_by_line[ln["id"]] = chunk
+        if ln["id"] not in line_ids:
+            line_ids.append(ln["id"])
 
     if not line_ids:
         return []
