@@ -20,6 +20,12 @@ name: Sync cart bookings to Appointments
 on:
   schedule:
     - cron: "*/15 0-9,18-23 * * *"
+  # EVENT-DRIVEN: an Odoo automation -> webhook -> Apps Script relay POSTs a
+  # repository_dispatch here the moment a customer checks out, so the booking reserves
+  # its slot within seconds (not up to 15 min later). Commits only when SYNC_BOOKINGS_ENABLED
+  # == 'true' (same gate as scheduled); bypasses the NZ-hours gate so it always runs.
+  repository_dispatch:
+    types: [booking-created]
   workflow_dispatch:
     inputs:
       order_id:
@@ -70,8 +76,8 @@ jobs:
         run: |
           H=$(TZ='Pacific/Auckland' date +%H)
           echo "NZ hour = $H"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "manual run -- bypassing NZ gate"; echo "run=yes" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "manual/event-driven run -- bypassing NZ gate"; echo "run=yes" >> "$GITHUB_OUTPUT"
           elif [ "$H" -lt 7 ] || [ "$H" -ge 21 ]; then
             echo "outside window -- no-op"; echo "run=no" >> "$GITHUB_OUTPUT"
           else
@@ -95,12 +101,12 @@ jobs:
           SYNC_ENABLED: ${{ vars.SYNC_BOOKINGS_ENABLED }}
         run: |
           FLAGS=""
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            # Scheduled runs commit ONLY when the owner has flipped the enable flag.
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            # Scheduled + event-driven runs commit ONLY when the owner flipped the enable flag.
             if [ "$SYNC_ENABLED" = "true" ]; then
               FLAGS="--commit --max 20"     # throttle any surprise backlog under the email cap
             else
-              echo "SYNC_BOOKINGS_ENABLED != true -> scheduled DRY-RUN only"
+              echo "SYNC_BOOKINGS_ENABLED != true -> DRY-RUN only"
             fi
           else
             # Manual dispatch honours its own inputs.
