@@ -697,6 +697,10 @@ def process(rec, writer):
         # colour tag by detailer (green North Shore / red Central)
         "categ_ids": [(6, 0, [RESOURCE_TAG[resource_id]])] if resource_id in RESOURCE_TAG else [],
         "location": location,
+        # Mobile detailing has no video call -> suppress the auto Google Meet link so it
+        # never appears in the booking email (belt-and-braces; the appointment types also
+        # have event_videocall_source cleared).
+        "videocall_location": False,
         "description": build_description(sdbk, resource_name, lid, order),
     }
     event_id = C.call("calendar.event", "create", vals, context=NOISE_OFF)
