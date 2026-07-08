@@ -136,7 +136,8 @@ ORDER_TOKEN = "SDCAL:L{line_id}=E{event_id}"      # order-ref audit token
 # A "confirmed booking" = the customer completed checkout. For a bank-transfer / COD
 # shop that is state 'sent' WITH a payment.transaction (a bare emailed quote / abandoned
 # cart has none), plus 'sale'/'done' (owner-confirmed = paid). ALL confirmed bookings go
-# on the calendar; the event shows PAID vs AWAITING so the detailer knows before the day.
+# on the calendar. The TILE shows paid via the title's 💰 (unpaid = no marker); the event
+# DESCRIPTION/email still spells out PAID vs AWAITING PAYMENT so the customer knows to pay.
 CONFIRMED_STATES = ["sent", "sale", "done"]
 PAID_STATES = ["sale", "done"]
 PST_MARKER = "<!-- PST:{state} -->"   # payment-state marker -> lets a re-run refresh status
@@ -493,12 +494,17 @@ def build_description(sdbk, resource_name, line_id, order):
     exists because the order reached a paid/confirmed state (sale/done -> the eligibility
     gate), and the order number + total let a detailer cross-check payment in one click.
     """
-    paid = ("PAID ✅" if is_paid(order)
-            else "AWAITING PAYMENT ⏳ (bank transfer / cash on day)")
+    # The calendar TILE shows paid via the title's 💰, but this description flows into the
+    # customer's booking EMAIL (mail.template 37 renders object.description), so keep the
+    # payment status here: paid = 💰 PAID, unpaid = ⏳ AWAITING PAYMENT + how to pay. The
+    # owner's "drop awaiting" note was about the calendar tile (title), not the email.
+    paid = ("\U0001f4b0 PAID"
+            if is_paid(order)
+            else "⏳ AWAITING PAYMENT (pay by bank transfer or cash on the day)")
     amt = order.get("amount_total")
     amt_str = f" · ${amt:.2f} NZD" if amt else ""
     lines = [
-        f"\U0001f4b3 {paid}",
+        paid,
         f"\U0001f697 Service: {sdbk['service_label']}",
         f"\U0001f4cd Suburb: {sdbk['suburb']}",
         f"\U0001f464 Detailer: {resource_name}",
@@ -507,6 +513,7 @@ def build_description(sdbk, resource_name, line_id, order):
         "",
         SYNC_TAG,
         MARKER_COMMENT.format(line_id=line_id),
+        # hidden payment-state marker -> lets a re-run detect sent->sale and flip 💰
         PST_MARKER.format(state=order.get("state")),
     ]
     return "<br/>\n".join(lines)
@@ -574,7 +581,7 @@ def process(rec, writer):
         ev = C.call("calendar.event", "read", [existing], fields=["description"])
         desc = (ev[0].get("description") if ev else "") or ""
         if want not in desc:
-            newstat = "PAID" if is_paid(order) else "AWAITING"
+            newstat = "PAID 💰" if is_paid(order) else "unpaid"
             if ARGS.dry_run:
                 log(f"  {oname} L{lid}: event {existing} status -> {newstat} (would-update)")
                 writer.writerow([_now(), oname, lid, "would-update", existing, f"state={order.get('state')}"])
