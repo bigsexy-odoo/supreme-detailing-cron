@@ -80,6 +80,23 @@ python sync_bookings.py --commit --max 3 --verbose
 
 ---
 
+## CRM step (added 2026-07-09, live)
+
+Every pass also runs `ensure_crm_opps()`: ONE opportunity per booked (eligible) order —
+team by detailer (Alex→North 4, Kade→Central 5), `expected_revenue` = order total, stage
+**Booked (Unpaid)** (5) vs **Booked** (6) by payment state, tag "Appointment Booking",
+linked to the order (`opportunity_id`) and its calendar events. Because it runs every
+cycle, a `sent→sale` transition **auto-promotes** the stage. Guardrails: only upgrades
+stages currently at New/Booked (Unpaid) (never touches human-moved stages), leaves
+ARCHIVED opps completely alone (archive = the way to hide test opps — deleting one would
+make the cron recreate it), adopts a pre-existing event-linked opp instead of duplicating.
+`appointment.type.lead_create` is now OFF everywhere (the thin $0 auto-opps are gone) —
+rollback map in `odoo-rpc/backups/20260709-appointment-lead-create.json`.
+
+Also every pass: the **blank-booking watchdog** — any eligible order whose hidden Booking
+value is blank/malformed (a slot lost client-side) gets a one-time Google Chat alert
+(`SDNOBK:L<line>` order-ref token = already alerted).
+
 ## Flags / safety (built in)
 - `--commit` required to act; **dry-run is default**. `--no-email` = create event, no email.
 - Only **paid** states (`sale`,`done`). `sent` quotes are UNPAID here → opt-in `--include-sent`.

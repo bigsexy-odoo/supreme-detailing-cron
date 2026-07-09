@@ -78,6 +78,7 @@ import csv
 import io
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -137,6 +138,22 @@ ORDER_TOKEN = "SDCAL:L{line_id}=E{event_id}"      # order-ref audit token
 # Blank-booking watchdog (added 2026-07-09 after the S00075 lost-booking incident):
 BOOKING_PTAVS = [54, 55, 56, 57, 58]  # hidden "Booking" is_custom PTAV per bookable template (tmpl 2/3/4/5/7)
 NOBK_TOKEN = "SDNOBK:L{line_id}"      # order-ref token: this blank line has been alerted already
+
+# ---- CRM step (bookings -> pipeline), added 2026-07-09 ----
+# One opportunity per booked ORDER (a multi-line order = one visit = one deal):
+# team by detailer, expected_revenue = order total, stage by payment state, linked to
+# the order (sale.order.opportunity_id) AND its calendar events (event.opportunity_id,
+# which lets route_leads_external.job_bookings tag/route + Chat-alert it).
+# Replaces the OBSOLETE route_bookings_to_crm.py (read calendar.booking, which the
+# custom cart never creates) and the appointment_crm lead_create auto-opps (thin $0
+# "New" opps -- being turned OFF; existing ones are ADOPTED via their event link).
+CRM_STAGE_NEW = 1              # crm.stage "New" (safe to upgrade from)
+CRM_STAGE_BOOKED_UNPAID = 5    # crm.stage "Booked (Unpaid)"
+CRM_STAGE_BOOKED = 6           # crm.stage "Booked" (paid)
+CRM_TEAM_BY_RESOURCE = {1: 4, 2: 5}   # appointment.resource -> crm.team (Alex->North, Kade->Central)
+CRM_TEAM_FALLBACK = 1                 # Sales (unknown/mixed detailer)
+CRM_TAG_BOOKING = 6            # crm.tag "Appointment Booking"
+CRM_REGION_TAG = {4: 2, 5: 3}  # crm.team -> crm.tag (North, Central)
 
 # A "confirmed booking" = the customer completed checkout. For a bank-transfer / COD
 # shop that is state 'sent' WITH a payment.transaction (a bare emailed quote / abandoned
@@ -361,7 +378,8 @@ def discover_bookings():
     order_ids = sorted({ln["order_id"][0] for ln in lines if ln.get("order_id")})
     orders = C.call("sale.order", "read", order_ids,
                     fields=["id", "name", "state", "partner_id", "client_order_ref",
-                            "date_order", "website_id", "amount_total", "transaction_ids"])
+                            "date_order", "website_id", "amount_total", "transaction_ids",
+                            "opportunity_id"])
     order_map = {o["id"]: o for o in orders}
 
     records = []
@@ -624,6 +642,151 @@ def check_blank_bookings(writer):
                        context=NOISE_OFF)
                 order["client_order_ref"] = new_ref
     return alerted
+
+
+# ---------------------------------------------------------------------------
+# CRM: one opportunity per booked order
+# ---------------------------------------------------------------------------
+def _order_event_ids(order):
+    """Event ids recorded in the order's SDCAL audit tokens (fresh in-memory copy)."""
+    ref = order.get("client_order_ref") or ""
+    return [int(m.group(1)) for m in re.finditer(r"SDCAL:L\d+=E(\d+)", ref)]
+
+
+def ensure_crm_opp(order, recs, writer):
+    """Create/upgrade THE opportunity for a booked order. Returns an outcome string.
+
+    - Idempotent via sale.order.opportunity_id; if unset, ADOPTS an existing opp already
+      linked to one of the order's calendar events (the appointment_crm lead_create era).
+    - Stage: Booked (paid) vs Booked (Unpaid); only ever moves a stage that is currently
+      New or Booked (Unpaid) -- never touches a stage a human advanced, never downgrades.
+    - An ARCHIVED linked opp is left completely alone (deliberate hide).
+    """
+    paid = is_paid(order)
+    target_stage = CRM_STAGE_BOOKED if paid else CRM_STAGE_BOOKED_UNPAID
+    ev_ids = _order_event_ids(order)
+
+    # resolve team from the first line's detailer
+    rid = resolve_resource(recs[0]["sdbk"]["resource_name"]) if recs else None
+    team_id = CRM_TEAM_BY_RESOURCE.get(rid, CRM_TEAM_FALLBACK)
+    tag_ids = [CRM_TAG_BOOKING] + ([CRM_REGION_TAG[team_id]] if team_id in CRM_REGION_TAG else [])
+
+    opp_id = order["opportunity_id"][0] if order.get("opportunity_id") else None
+    adopted = False
+    if not opp_id and ev_ids:
+        evs = C.call("calendar.event", "read", ev_ids, fields=["opportunity_id"])
+        for e in evs:
+            if e.get("opportunity_id"):
+                opp_id = e["opportunity_id"][0]
+                adopted = True
+                break
+
+    if opp_id:
+        opp = C.call("crm.lead", "read", [opp_id],
+                     fields=["id", "name", "stage_id", "expected_revenue", "tag_ids", "active"],
+                     context={"active_test": False})
+        opp = opp[0] if opp else None
+        if not opp:
+            opp_id = None          # ghost link (opp deleted) -> recreate below
+        elif not opp.get("active"):
+            vlog(f"    CRM {order['name']}: opp {opp_id} archived -- leaving alone")
+            return "crm-skip"
+        else:
+            vals = {}
+            cur_stage = opp["stage_id"][0] if opp.get("stage_id") else None
+            if cur_stage in (CRM_STAGE_NEW, CRM_STAGE_BOOKED_UNPAID) and cur_stage != target_stage:
+                vals["stage_id"] = target_stage
+            if not opp.get("expected_revenue"):
+                vals["expected_revenue"] = order.get("amount_total") or 0.0
+            missing_tags = [t for t in tag_ids if t not in (opp.get("tag_ids") or [])]
+            if missing_tags:
+                vals["tag_ids"] = [(4, t) for t in missing_tags]
+            link_order = adopted or not order.get("opportunity_id")
+            unlinked_evs = []
+            if ev_ids:
+                evs = C.call("calendar.event", "read", ev_ids, fields=["opportunity_id"])
+                unlinked_evs = [e["id"] for e in evs if not e.get("opportunity_id")]
+            if not vals and not link_order and not unlinked_evs:
+                vlog(f"    CRM {order['name']}: opp {opp_id} current -- nothing to do")
+                return "crm-current"
+            if ARGS.dry_run:
+                log(f"    CRM {order['name']}: DRY-RUN would update opp {opp_id} "
+                    f"{vals} link_order={link_order} link_events={unlinked_evs}")
+                return "crm-would-update"
+            if vals:
+                C.call("crm.lead", "write", [opp_id], vals, context=NOISE_OFF)
+            if link_order:
+                C.call("sale.order", "write", [order["id"]], {"opportunity_id": opp_id},
+                       context=NOISE_OFF)
+                order["opportunity_id"] = [opp_id, opp["name"]]
+            if unlinked_evs:
+                C.call("calendar.event", "write", unlinked_evs, {"opportunity_id": opp_id},
+                       context=NOISE_OFF)
+            log(f"    CRM {order['name']}: opp {opp_id} updated {vals or ''}"
+                f"{' +adopted' if adopted else ''}{' +events' + str(unlinked_evs) if unlinked_evs else ''}")
+            writer.writerow([_now(), order["name"], "", "crm-updated", opp_id, str(vals)])
+            return "crm-updated"
+
+    # ---- create ----
+    pname = order["partner_id"][1] if order.get("partner_id") else "?"
+    dates = sorted(r["sdbk"]["date"] for r in recs)
+    desc_lines = ["<div>" + ("PAID ✅" if paid else "AWAITING PAYMENT ⏳ (bank transfer / cash on day)")]
+    for r in recs:
+        s = r["sdbk"]
+        desc_lines.append(f"🚗 {s['service_label']} — {s['date']} {s['time24']} "
+                          f"({s['duration']}h) — {s['resource_name']} — {s['suburb']}")
+    desc_lines.append(f"🧾 {order['name']} ${order.get('amount_total')}</div>")
+    vals = {
+        "name": f"Booking {order['name']} - {pname}",
+        "type": "opportunity",
+        "partner_id": order["partner_id"][0] if order.get("partner_id") else False,
+        "team_id": team_id,
+        "stage_id": target_stage,
+        "expected_revenue": order.get("amount_total") or 0.0,
+        "tag_ids": [(6, 0, tag_ids)],
+        "date_deadline": dates[0] if dates else False,
+        "description": "<br/>".join(desc_lines),
+    }
+    if ARGS.dry_run:
+        log(f"    CRM {order['name']}: DRY-RUN would create opp "
+            f"[team {team_id}, stage {target_stage}, ${vals['expected_revenue']}]")
+        return "crm-would-create"
+    res = C.call("crm.lead", "create", vals, context=NOISE_OFF)
+    opp_id = res[0] if isinstance(res, (list, tuple)) else res   # Rule 10a: create returns [id]
+    C.call("sale.order", "write", [order["id"]], {"opportunity_id": opp_id}, context=NOISE_OFF)
+    order["opportunity_id"] = [opp_id, vals["name"]]
+    if ev_ids:
+        C.call("calendar.event", "write", ev_ids, {"opportunity_id": opp_id}, context=NOISE_OFF)
+    log(f"    CRM {order['name']}: created opp {opp_id} [team {team_id}, "
+        f"stage {'Booked' if paid else 'Booked (Unpaid)'}, ${vals['expected_revenue']}] "
+        f"events={ev_ids}")
+    writer.writerow([_now(), order["name"], "", "crm-created", opp_id,
+                     f"team{team_id}|stage{target_stage}|{vals['expected_revenue']}"])
+    return "crm-created"
+
+
+def ensure_crm_opps(records, writer):
+    """Group SDBK1 records by order and ensure each ELIGIBLE order has its opportunity.
+    Runs every pass, so a sent->sale transition auto-promotes Booked (Unpaid) -> Booked."""
+    by_order = {}
+    for rec in records:
+        by_order.setdefault(rec["order"]["id"], []).append(rec)
+    tallies = {}
+    for oid, recs in sorted(by_order.items()):
+        order = recs[0]["order"]
+        try:
+            ok, why = is_eligible(order)
+            if not ok:
+                vlog(f"    CRM {order['name']}: ineligible ({why})")
+                continue
+            outcome = ensure_crm_opp(order, recs, writer)
+            tallies[outcome] = tallies.get(outcome, 0) + 1
+        except Exception as e:  # noqa: BLE001 - one bad order never aborts the pass
+            tallies["crm-error"] = tallies.get("crm-error", 0) + 1
+            log(f"    CRM ERROR {order['name']}: {type(e).__name__}: {e}")
+            writer.writerow([_now(), order["name"], "", "crm-error", "",
+                             f"{type(e).__name__}: {e}"])
+    return tallies
 
 
 # ---------------------------------------------------------------------------
@@ -1010,6 +1173,14 @@ def _run(mode):
                 writer.writerow([_now(), rec["order"]["name"], rec["line"]["id"],
                                  "error", "", f"{type(e).__name__}: {e}"])
 
+        # CRM: one opportunity per booked order (stage by payment state). Runs every
+        # pass -> sent->sale transitions auto-promote Booked (Unpaid) -> Booked.
+        try:
+            crm = ensure_crm_opps(records, writer)
+            counts.update(crm)
+        except Exception as e:  # noqa: BLE001
+            log(f"    CRM step failed (non-fatal): {type(e).__name__}: {e}")
+
         # Watchdog: eligible orders whose Booking value is blank (lost client-side). Never
         # aborts the run -- alerting is best-effort on top of the main sync.
         try:
@@ -1017,6 +1188,8 @@ def _run(mode):
         except Exception as e:  # noqa: BLE001
             log(f"    blank-booking watchdog failed (non-fatal): {type(e).__name__}: {e}")
 
+    log(f"    CRM: " + (", ".join(f"{k.replace('crm-', '')}={v}" for k, v in sorted(counts.items())
+                                  if k.startswith("crm-")) or "nothing to do"))
     log(f"    blank-booking alerts: {counts.get('blank-alert', 0)}")
     log(f"=== done [{mode}] created={counts['created']} would-create={counts['would-create']} "
         f"updated={counts['updated']} would-update={counts['would-update']} "
