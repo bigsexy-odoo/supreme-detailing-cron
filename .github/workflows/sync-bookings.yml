@@ -127,6 +127,7 @@ jobs:
           ODOO_DB: ${{ secrets.ODOO_DB }}
           ODOO_USER: ${{ secrets.ODOO_USER }}
           ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+          GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}  # blank-booking watchdog alerts
         run: python sync_bookings.py ${{ steps.flags.outputs.flags }} --verbose
 
       - name: Upload run log

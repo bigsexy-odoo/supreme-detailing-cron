@@ -76,9 +76,11 @@ Creds: odoo_client.cfg() reads env vars first (GitHub secrets) then .env.
 import argparse
 import csv
 import io
+import json
 import os
 import sys
 import time
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -87,7 +89,7 @@ from zoneinfo import ZoneInfo
 if sys.stdout.encoding != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
-from odoo_client import OdooClient
+from odoo_client import OdooClient, cfg
 
 # ---------------------------------------------------------------------------
 # Constants -- mirrored from the one known-good event (calendar.event id 2)
@@ -132,6 +134,9 @@ UTC = ZoneInfo("UTC")
 SYNC_TAG = "[SD-booking-sync]"                    # visible provenance line in the description
 MARKER_COMMENT = "<!-- SDBK1:L{line_id} -->"      # BOUNDED per-line idempotency key (full comment)
 ORDER_TOKEN = "SDCAL:L{line_id}=E{event_id}"      # order-ref audit token
+# Blank-booking watchdog (added 2026-07-09 after the S00075 lost-booking incident):
+BOOKING_PTAVS = [54, 55, 56, 57, 58]  # hidden "Booking" is_custom PTAV per bookable template (tmpl 2/3/4/5/7)
+NOBK_TOKEN = "SDNOBK:L{line_id}"      # order-ref token: this blank line has been alerted already
 
 # A "confirmed booking" = the customer completed checkout. For a bank-transfer / COD
 # shop that is state 'sent' WITH a payment.transaction (a bare emailed quote / abandoned
@@ -532,6 +537,96 @@ def append_order_marker(order, line_id, event_id):
 
 
 # ---------------------------------------------------------------------------
+# Blank-booking watchdog
+# ---------------------------------------------------------------------------
+def _chat_hook():
+    hook = os.environ.get("GCHAT_WEBHOOK_URL")
+    if hook:
+        return hook
+    try:
+        return cfg("GCHAT_WEBHOOK_URL")
+    except Exception:
+        return ""
+
+
+def _chat_alert(text):
+    """Best-effort plain-text post to the Google Chat space. Never raises."""
+    hook = _chat_hook()
+    if not hook:
+        return False
+    try:
+        req = urllib.request.Request(
+            hook, data=json.dumps({"text": text}).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=UTF-8"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return 200 <= resp.status < 300
+    except Exception as e:  # noqa: BLE001 - alerts must never fail the run
+        log(f"    Chat alert failed: {type(e).__name__}: {e}")
+        return False
+
+
+def check_blank_bookings(writer):
+    """WATCHDOG (2026-07-09, after S00075): a service line on an ELIGIBLE order whose hidden
+    Booking custom value is blank/garbage means the customer's chosen slot was LOST client-side
+    (pre-fix swapLine wiped it; pricing-modal adds never captured one). The main pass cannot
+    see those lines (discovery needs 'SDBK1%'), so without this check a confirmed job silently
+    never reaches the calendar. Loud log + one-time Google Chat alert per line (NOBK token on
+    the order marks it as alerted; dry-run only reports)."""
+    domain = ["&",
+              ["custom_product_template_attribute_value_id", "in", BOOKING_PTAVS],
+              "|", ["custom_value", "=", False], ["custom_value", "not like", "SDBK1|"]]
+    cavs = C.call("product.attribute.custom.value", "search_read", domain,
+                  fields=["id", "custom_value", "sale_order_line_id"])
+    vlog(f"blank-booking watchdog: {len(cavs)} blank/malformed Booking value(s)")
+    line_ids = sorted({v["sale_order_line_id"][0] for v in cavs if v.get("sale_order_line_id")})
+    if not line_ids:
+        return 0
+    lines = C.call("sale.order.line", "read", line_ids,
+                   fields=["id", "name", "order_id", "product_uom_qty"])
+    order_ids = sorted({l["order_id"][0] for l in lines if l.get("order_id")})
+    orders = C.call("sale.order", "read", order_ids,
+                    fields=["id", "name", "state", "partner_id", "client_order_ref",
+                            "date_order", "amount_total", "transaction_ids"])
+    omap = {o["id"]: o for o in orders}
+    alerted = 0
+    for ln in lines:
+        if not ln.get("order_id"):
+            continue
+        order = omap.get(ln["order_id"][0])
+        if not order:
+            continue
+        ok, why = is_eligible(order)
+        if not ok:
+            vlog(f"    blank-booking L{ln['id']} {order['name']}: ineligible ({why})")
+            continue
+        token = NOBK_TOKEN.format(line_id=ln["id"])
+        if token in (order.get("client_order_ref") or ""):
+            vlog(f"    blank-booking L{ln['id']} {order['name']}: already alerted")
+            continue
+        svc = (ln.get("name") or "").splitlines()[0][:70]
+        pname = order["partner_id"][1] if order.get("partner_id") else "?"
+        msg = (f"⚠️ BOOKING MISSING — order {order['name']} ({pname}, "
+               f"${order.get('amount_total')}) line ‘{svc}’ has no appointment time "
+               f"attached. The customer's chosen slot was lost before checkout — contact "
+               f"them and book it manually: {C.url}/odoo/sales/{order['id']}")
+        log(f"    *** {msg}")
+        writer.writerow([_now(), order["name"], ln["id"], "blank-booking", "", svc])
+        alerted += 1
+        if ARGS.commit:
+            posted = _chat_alert(msg)
+            log(f"    blank-booking alert posted to Chat: {posted}")
+            # Mark as alerted once it reached Chat (or when no hook is configured at all, so
+            # log-only setups don't re-log forever). A failed post retries next run.
+            if posted or not _chat_hook():
+                ref = order.get("client_order_ref") or ""
+                new_ref = (ref + ";" if ref and not ref.endswith(";") else ref) + token
+                C.call("sale.order", "write", [order["id"]], {"client_order_ref": new_ref},
+                       context=NOISE_OFF)
+                order["client_order_ref"] = new_ref
+    return alerted
+
+
+# ---------------------------------------------------------------------------
 # Core: process one booking line
 # ---------------------------------------------------------------------------
 def process(rec, writer):
@@ -915,6 +1010,14 @@ def _run(mode):
                 writer.writerow([_now(), rec["order"]["name"], rec["line"]["id"],
                                  "error", "", f"{type(e).__name__}: {e}"])
 
+        # Watchdog: eligible orders whose Booking value is blank (lost client-side). Never
+        # aborts the run -- alerting is best-effort on top of the main sync.
+        try:
+            counts["blank-alert"] = check_blank_bookings(writer)
+        except Exception as e:  # noqa: BLE001
+            log(f"    blank-booking watchdog failed (non-fatal): {type(e).__name__}: {e}")
+
+    log(f"    blank-booking alerts: {counts.get('blank-alert', 0)}")
     log(f"=== done [{mode}] created={counts['created']} would-create={counts['would-create']} "
         f"updated={counts['updated']} would-update={counts['would-update']} "
         f"deferred={counts['deferred']} skip={counts['skip']} conflict={counts['conflict']} "
