@@ -63,13 +63,13 @@ def lead_to_message(lead: dict, base_url: str = "") -> str:
     return "\n".join(lines)
 
 
-def post_to_chat(text: str, webhook_url: str = None, timeout: int = 20) -> bool:
-    """POST {'text': …} to the Chat incoming webhook. Returns True on 2xx.
-    Surfaces Chat's JSON error body instead of swallowing it."""
+def post_payload(payload: dict, webhook_url: str = None, timeout: int = 20) -> bool:
+    """POST an arbitrary Chat message payload dict (text and/or cardsV2) to the
+    incoming webhook. Returns True on 2xx. Surfaces Chat's JSON error body."""
     url = webhook_url or os.environ.get("GCHAT_WEBHOOK_URL")
     if not url:
         raise RuntimeError("GCHAT_WEBHOOK_URL not set")
-    body = json.dumps({"text": text}).encode("utf-8")
+    body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url, data=body,
         headers={"Content-Type": "application/json; charset=UTF-8"}, method="POST")
@@ -82,6 +82,11 @@ def post_to_chat(text: str, webhook_url: str = None, timeout: int = 20) -> bool:
     except urllib.error.URLError as e:
         print(f"  [chat] network error: {e.reason}")
         return False
+
+
+def post_to_chat(text: str, webhook_url: str = None, timeout: int = 20) -> bool:
+    """POST {'text': …} to the Chat incoming webhook (plain-text convenience)."""
+    return post_payload({"text": text}, webhook_url, timeout)
 
 
 if __name__ == "__main__":

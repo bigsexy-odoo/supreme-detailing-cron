@@ -26,7 +26,9 @@ if sys.stdout.encoding != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 from odoo_client import OdooClient
-from chat_poster import post_to_chat
+from chat_poster import post_payload
+import enrich_calendar_events as E
+import booking_card as BC
 
 NZST = timezone(timedelta(hours=12))
 
@@ -73,9 +75,17 @@ def format_date_display(date_str):
 
 
 def fetch_events_for_date(c, target_date):
-    """Fetch all appointment calendar events for a specific date."""
-    start_of_day = f"{target_date} 00:00:00"
-    end_of_day = f"{target_date} 23:59:59"
+    """Fetch all appointment calendar events for a specific NZ calendar date.
+
+    `start` is stored in UTC, so convert the NZ-day bounds to UTC — otherwise a
+    NZ-morning booking (9am NZ = 21:00 UTC the previous day) falls in the wrong
+    UTC day and gets missed.
+    """
+    y, m, d = (int(x) for x in target_date.split("-"))
+    nz_start = datetime(y, m, d, 0, 0, 0, tzinfo=NZST)
+    nz_end = datetime(y, m, d, 23, 59, 59, tzinfo=NZST)
+    start_of_day = nz_start.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    end_of_day = nz_end.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     domain = [
         ["appointment_type_id", "!=", False],
@@ -233,6 +243,10 @@ def main():
     c = OdooClient()
     print(f"    Connected to {c.url} as uid={c.uid}")
 
+    # Lookups for rich-card gathering (shared with enrich_calendar_events)
+    answer_labels = E.fetch_answer_labels(c)
+    resource_names = E.fetch_resource_names(c)
+
     events = fetch_events_for_date(c, target_date)
     print(f"    Found {len(events)} event(s) for {target_date}")
 
@@ -253,31 +267,41 @@ def main():
     if unassigned:
         print(f"    WARNING: {len(unassigned)} event(s) with no resource assigned")
 
-    # Post to each resource's Chat space
+    # Post a rich cardsV2 message to each resource's Chat space
+    date_display = format_date_display(target_date)
     posted = 0
     for resource_id, webhook_env in RESOURCE_WEBHOOK.items():
         webhook_url = os.environ.get(webhook_env)
         resource_name = RESOURCE_NAMES.get(resource_id, f"Resource {resource_id}")
+        title = f"{date_display} — {resource_name}"
 
         resource_events = grouped.get(resource_id, [])
-
         if resource_events:
-            message = build_summary_message(resource_id, resource_events, target_date)
+            bookings = [BC.gather_booking(c, ev, answer_labels, resource_names)
+                        for ev in resource_events]
+            # Tier 3: attach signed Mark-paid / Change-stage buttons (only if configured)
+            act_url = os.environ.get("SD_ACTION_URL")
+            act_secret = os.environ.get("SD_ACTION_SECRET")
+            if act_url and act_secret:
+                for b in bookings:
+                    b["action_buttons"] = BC.action_buttons(b["event_id"], act_url, act_secret)
+            text = BC.summary_text(resource_name, date_display, bookings)
+            payload = BC.day_message(text, bookings, c.url)
         else:
-            message = build_no_jobs_message(resource_id, target_date)
+            payload = BC.no_jobs_message(resource_name, date_display)
 
         print(f"\n  --- {resource_name} ({len(resource_events)} jobs) ---")
-        print(message)
+        print(f"  {payload.get('text')}")
 
         if args.dry_run:
-            print(f"  DRY RUN — would post to {webhook_env}")
+            print(f"  DRY RUN — would post cardsV2 to {webhook_env}")
             continue
 
         if not webhook_url:
             print(f"  SKIP — {webhook_env} not set")
             continue
 
-        if post_to_chat(message, webhook_url):
+        if post_payload(payload, webhook_url):
             print(f"  POSTED to {webhook_env}")
             posted += 1
         else:
