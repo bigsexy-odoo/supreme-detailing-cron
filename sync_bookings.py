@@ -81,6 +81,7 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -550,6 +551,30 @@ def build_description(sdbk, resource_name, line_id, order):
             else "⏳ AWAITING PAYMENT (pay by bank transfer or cash on the day)")
     amt = order.get("amount_total")
     amt_str = f" · ${amt:.2f} NZD" if amt else ""
+
+    # Detailer-facing quick actions — tappable Call + Directions (like the Google Chat
+    # card). These render in the Odoo event form/popup AND in the detailer's synced Google
+    # Calendar entry. Safe here: the customer email (template 37) renders LOCATION, not the
+    # description, so these never reach the customer.
+    actions = []
+    pid = order.get("partner_id")[0] if order.get("partner_id") else None
+    if pid:
+        pr = C.call("res.partner", "read", [pid],
+                    fields=["phone", "street", "street2", "city", "zip"])
+        p = pr[0] if pr else {}
+        if p.get("phone"):
+            tel = re.sub(r"[^\d+]", "", p["phone"])
+            actions.append(f'\U0001f4de <a href="tel:{tel}">Call</a>')
+        addr = ", ".join(x for x in [
+            ", ".join(y for y in [p.get("street"), p.get("street2")] if y),
+            " ".join(y for y in [p.get("city"), p.get("zip")] if y),
+        ] if x) or sdbk.get("suburb")
+        if addr:
+            q = urllib.parse.quote(f"{addr}, Auckland")
+            actions.append(
+                f'\U0001f9ed <a href="https://www.google.com/maps/search/?api=1&amp;query={q}">Directions</a>')
+    action_line = [" &#183; ".join(actions)] if actions else []
+
     lines = [
         paid,
         f"\U0001f697 Service: {sdbk['service_label']}",
@@ -557,6 +582,7 @@ def build_description(sdbk, resource_name, line_id, order):
         f"\U0001f464 Detailer: {resource_name}",
         f"\U0001f550 {sdbk['date']} {sdbk['time24']} ({sdbk['duration']}h) NZ",
         f"\U0001f9fe Order {order.get('name')}{amt_str}",
+        *action_line,
         "",
         SYNC_TAG,
         MARKER_COMMENT.format(line_id=line_id),
