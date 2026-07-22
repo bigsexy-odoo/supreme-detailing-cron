@@ -241,31 +241,43 @@ def detailer_partner_for(resource_id):
     return pid, has_email
 
 
-def ensure_detailer_attendee(event_id, resource_id):
-    """Attach the detailer contact as a calendar attendee (idempotent, self-healing).
-    Makes the booking show on the main calendar + colour by detailer. Re-runs safely: only
-    writes if the detailer is currently missing, so a later run repairs any strip (manual
-    edit, or a residual reap if the contact's email was blank at create time). Warns loudly
-    when the detailer contact has no email, because Odoo will then reap it ~80s later."""
-    pid, has_email = detailer_partner_for(resource_id)
-    if not pid:
-        return
-    if not has_email:
-        log(f"      WARNING: detailer contact {pid} (resource {resource_id}) has NO email "
-            f"-> Odoo reaps emailless attendees ~80s later and the detailer colour vanishes. "
-            f"Set an email on that contact to fix the colour.")
-    cur = C.call("calendar.event", "read", [event_id], fields=["partner_ids"])
+def ensure_detailer_attendee(event_id, resource_id=None):
+    """Make the detailer attendee (=the calendar COLOUR) follow the booking's ASSIGNED resource,
+    and STRIP the OTHER detailer contact if it's stale (e.g. after a reassignment). The event's
+    OWN `appointment_resource_ids` is the SOURCE OF TRUTH for who the detailer is -- so a manual
+    gantt reassign (Alex→Kade) or reassign_detailer.py is respected automatically: we read the
+    resource off the event and make the attendee match it (resource_id is only a fallback for a
+    fresh event that has no resource yet). Idempotent + self-healing; warns loudly when the
+    detailer contact has no email (Odoo reaps emailless attendees ~80s later → colour vanishes)."""
+    cur = C.call("calendar.event", "read", [event_id],
+                 fields=["partner_ids", "appointment_resource_ids"])
     if not cur:
         log(f"      WARNING: event {event_id} not readable -> detailer colour self-heal "
             f"skipped (event may have been deleted).")
         return
-    if pid not in cur[0]["partner_ids"]:
-        if ARGS.dry_run:
-            vlog(f"[dry-run] would attach detailer {pid} to event {event_id}")
-        else:
-            C.call("calendar.event", "write", [event_id],
-                   {"partner_ids": [(4, pid)]}, context=NOISE_OFF)
-            vlog(f"detailer {pid} attached to event {event_id}")
+    ev = cur[0]
+    rid_list = ev.get("appointment_resource_ids") or ([resource_id] if resource_id else [])
+    rid = rid_list[0] if rid_list else None
+    if not rid:
+        return
+    pid, has_email = detailer_partner_for(rid)
+    if not pid:
+        return
+    if not has_email:
+        log(f"      WARNING: detailer contact {pid} (resource {rid}) has NO email "
+            f"-> Odoo reaps emailless attendees ~80s later and the detailer colour vanishes. "
+            f"Set an email on that contact to fix the colour.")
+    attendees = ev["partner_ids"]
+    stale = [q for q in RESOURCE_PARTNER.values() if q != pid and q in attendees]  # the OTHER detailer
+    cmds = ([(4, pid)] if pid not in attendees else []) + [(3, q) for q in stale]  # (3,_)=unlink attendee
+    if not cmds:
+        return
+    if ARGS.dry_run:
+        vlog(f"[dry-run] event {event_id}: attendee -> detailer {pid}, strip stale {stale}")
+    else:
+        C.call("calendar.event", "write", [event_id],
+               {"partner_ids": cmds}, context=NOISE_OFF)
+        vlog(f"event {event_id}: detailer attendee set {pid}, stripped stale {stale}")
 
 
 def parse_sdbk1(raw):
