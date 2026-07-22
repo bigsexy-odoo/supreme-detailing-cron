@@ -41,4 +41,6 @@ jobs:
           ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
           GCHAT_NORTH_WEBHOOK: ${{ secrets.GCHAT_NORTH_WEBHOOK }}
           GCHAT_CENTRAL_WEBHOOK: ${{ secrets.GCHAT_CENTRAL_WEBHOOK }}
+          SD_ACTION_URL: ${{ secrets.SD_ACTION_URL }}
+          SD_ACTION_SECRET: ${{ secrets.SD_ACTION_SECRET }}
         run: python daily_summary.py
