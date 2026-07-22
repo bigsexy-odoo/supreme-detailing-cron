@@ -164,6 +164,14 @@ CONFIRMED_STATES = ["sent", "sale", "done"]
 PAID_STATES = ["sale", "done"]
 PST_MARKER = "<!-- PST:{state} -->"   # payment-state marker -> lets a re-run refresh status
 
+# ---- MODEL A order->invoice lifecycle (added 2026-07-23) ----
+# A confirmed booking auto-progresses: Quotation -> SALES ORDER -> POSTED invoice (Awaiting
+# Payment, Due on receipt) + invoice email #10. 'Paid' is decided by the invoice's
+# payment_state (see is_paid), NOT the order state -- so a confirmed booking stays AWAITING
+# PAYMENT until the bank transfer is registered. All external = ZERO billable LoC (Rule 9).
+INVOICE_TEMPLATE = 10          # mail.template "Invoice: Sending" -> renders the branded PDF (report 790)
+DUE_ON_RECEIPT_TERM = 11       # account.payment.term "Due on receipt" (Model A: pay by bank transfer after)
+
 # Suppress ALL mail/log noise on the create; we send template 37 explicitly afterwards.
 # `no_mail_to_attendees` stops Odoo's generic .ics calendar invite so we don't double-mail.
 NOISE_OFF = {
@@ -379,7 +387,7 @@ def discover_bookings():
     orders = C.call("sale.order", "read", order_ids,
                     fields=["id", "name", "state", "partner_id", "client_order_ref",
                             "date_order", "website_id", "amount_total", "transaction_ids",
-                            "opportunity_id"])
+                            "opportunity_id", "invoice_ids", "payment_term_id"])
     order_map = {o["id"]: o for o in orders}
 
     records = []
@@ -401,7 +409,23 @@ def discover_bookings():
 
 
 def is_paid(order):
-    return order.get("state") in PAID_STATES
+    """MODEL A: PAID = the order's posted customer invoice is SETTLED (money received), NOT
+    merely that the order is confirmed (state='sale'). The sync now auto-confirms a booking to
+    a Sales Order at booking time, so order-state can no longer stand in for 'paid' -- a
+    confirmed-but-unpaid booking must still read AWAITING PAYMENT until the bank transfer is
+    registered. Cached on the (shared) order dict to avoid repeat RPCs within a pass."""
+    if "_paid" in order:
+        return order["_paid"]
+    paid = False
+    inv_ids = order.get("invoice_ids") or []
+    if inv_ids:
+        moves = C.call("account.move", "read", inv_ids,
+                       fields=["move_type", "state", "payment_state"])
+        paid = any(m.get("move_type") == "out_invoice" and m.get("state") == "posted"
+                   and (m.get("payment_state") in ("paid", "in_payment", "reversed"))
+                   for m in moves)
+    order["_paid"] = paid
+    return paid
 
 
 def is_eligible(order):
@@ -790,6 +814,113 @@ def ensure_crm_opps(records, writer):
 
 
 # ---------------------------------------------------------------------------
+# MODEL A: confirm the order -> Sales Order, raise + post its invoice, email #10
+# ---------------------------------------------------------------------------
+def _order_out_invoices(order_id):
+    """Fresh read of the order's customer-invoice (out_invoice) moves -> [(id, state), ...]."""
+    inv = C.call("sale.order", "read", [order_id], fields=["invoice_ids"])[0].get("invoice_ids") or []
+    if not inv:
+        return []
+    moves = C.call("account.move", "read", inv, fields=["id", "move_type", "state"])
+    return [(m["id"], m["state"]) for m in moves if m.get("move_type") == "out_invoice"]
+
+
+def confirm_and_invoice_order(order, recs, writer):
+    """MODEL A order->invoice lifecycle for ONE confirmed booking order. Idempotent; honours
+    --dry-run and --no-email:
+      1. sent -> SALES ORDER (action_confirm); payment term aligned to 'Due on receipt';
+      2. raise + POST the invoice (Awaiting Payment) if the order has none;
+      3. queue invoice email #10 once (guard = account.move.is_move_sent).
+    Does NOT touch 'paid' -- is_paid() reads the invoice's payment_state, so a confirmed-but-
+    unpaid order correctly stays AWAITING PAYMENT until the transfer is registered."""
+    oname = order["name"]
+    acts = []
+
+    # 1) CONFIRM  sent -> sale (Sales Order); align the term to Due on receipt.
+    if order.get("state") == "sent":
+        if ARGS.dry_run:
+            acts.append("would-confirm")
+        else:
+            if not order.get("payment_term_id") or order["payment_term_id"][0] != DUE_ON_RECEIPT_TERM:
+                C.call("sale.order", "write", [order["id"]],
+                       {"payment_term_id": DUE_ON_RECEIPT_TERM}, context=NOISE_OFF)
+            C.call("sale.order", "action_confirm", [order["id"]], context=NOISE_OFF)
+            order["state"] = "sale"
+            acts.append("confirmed")
+            log(f"    INV {oname}: confirmed -> Sales Order")
+
+    if order.get("state") not in ("sale", "done"):
+        acts.append("unconfirmed")
+        writer.writerow([_now(), oname, "", "invoice", "", "|".join(acts)])
+        return acts
+
+    # 2) INVOICE  create + post if the order has none yet.
+    invs = _order_out_invoices(order["id"])
+    inv_id = invs[0][0] if invs else None
+    if invs:
+        acts.append("inv-exists")
+    elif ARGS.dry_run:
+        acts.append("would-invoice")
+    else:
+        ctx = {"active_ids": [order["id"]], "active_model": "sale.order"}
+        wid = C.call("sale.advance.payment.inv", "create",
+                     [{"advance_payment_method": "delivered"}], context=ctx)
+        wid = wid[0] if isinstance(wid, list) else wid
+        C.call("sale.advance.payment.inv", "create_invoices", [wid], context=ctx)
+        drafts = [i for i, st in _order_out_invoices(order["id"]) if st == "draft"]
+        for d in drafts:
+            C.call("account.move", "write", [d],
+                   {"invoice_payment_term_id": DUE_ON_RECEIPT_TERM}, context=NOISE_OFF)
+            C.call("account.move", "action_post", [d])
+        posted = [i for i, st in _order_out_invoices(order["id"]) if st == "posted"]
+        inv_id = posted[0] if posted else (drafts[0] if drafts else None)
+        acts.append(f"invoiced:{inv_id}")
+        log(f"    INV {oname}: posted invoice {inv_id} (Due on receipt / Awaiting Payment)")
+
+    # 3) INVOICE EMAIL #10  (once; queued force_send=False -> cap-safe like #37).
+    if inv_id and ARGS.dry_run and not ARGS.no_email:
+        acts.append("would-email-invoice")
+    elif inv_id and not ARGS.no_email:
+        mv = C.call("account.move", "read", [inv_id], fields=["is_move_sent", "state"])[0]
+        if mv.get("state") == "posted" and not mv.get("is_move_sent"):
+            try:
+                C.call("mail.template", "send_mail", INVOICE_TEMPLATE, inv_id, force_send=False)
+                C.call("account.move", "write", [inv_id], {"is_move_sent": True}, context=NOISE_OFF)
+                acts.append("inv-email-queued")
+                log(f"    INV {oname}: queued invoice email #{INVOICE_TEMPLATE} for move {inv_id}")
+            except Exception as e:  # noqa: BLE001
+                acts.append("inv-email-failed")
+                log(f"    INV {oname}: invoice email queue failed: {e}")
+
+    writer.writerow([_now(), oname, "", "invoice", inv_id or "", "|".join(acts)])
+    return acts
+
+
+def confirm_and_invoice_orders(records, writer):
+    """Group SDBK1 records by order; run the Model-A confirm+invoice+email lifecycle on each
+    ELIGIBLE order exactly once per pass. One bad order never aborts the run."""
+    by_order = {}
+    for rec in records:
+        by_order.setdefault(rec["order"]["id"], []).append(rec)
+    tally = {}
+    for oid, recs in sorted(by_order.items()):
+        order = recs[0]["order"]
+        try:
+            ok, why = is_eligible(order)
+            if not ok:
+                continue
+            for a in confirm_and_invoice_order(order, recs, writer):
+                key = a.split(":")[0]
+                tally[key] = tally.get(key, 0) + 1
+        except Exception as e:  # noqa: BLE001 - one bad order never aborts the pass
+            tally["inv-error"] = tally.get("inv-error", 0) + 1
+            log(f"    INV ERROR {order['name']}: {type(e).__name__}: {e}")
+            writer.writerow([_now(), order["name"], "", "inv-error", "",
+                             f"{type(e).__name__}: {e}"])
+    return tally
+
+
+# ---------------------------------------------------------------------------
 # Core: process one booking line
 # ---------------------------------------------------------------------------
 def process(rec, writer):
@@ -1173,8 +1304,19 @@ def _run(mode):
                 writer.writerow([_now(), rec["order"]["name"], rec["line"]["id"],
                                  "error", "", f"{type(e).__name__}: {e}"])
 
-        # CRM: one opportunity per booked order (stage by payment state). Runs every
-        # pass -> sent->sale transitions auto-promote Booked (Unpaid) -> Booked.
+        # MODEL A: confirm each eligible order -> Sales Order, raise+post its invoice
+        # (Awaiting Payment / Due on receipt), queue invoice email #10. Idempotent; runs
+        # BEFORE the CRM step so order state + invoice are settled first.
+        try:
+            inv = confirm_and_invoice_orders(records, writer)
+            counts.update(inv)
+            log("    INV: " + (", ".join(f"{k}={v}" for k, v in sorted(inv.items())) or "nothing to do"))
+        except Exception as e:  # noqa: BLE001
+            log(f"    invoice step failed (non-fatal): {type(e).__name__}: {e}")
+
+        # CRM: one opportunity per booked order (stage by payment state). is_paid now reads the
+        # invoice's payment_state, so a booking promotes Booked (Unpaid) -> Booked only when the
+        # transfer is actually registered (NOT merely on sent->sale confirmation).
         try:
             crm = ensure_crm_opps(records, writer)
             counts.update(crm)
