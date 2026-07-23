@@ -274,7 +274,10 @@ def booking_card(b, base_url=""):
 
     buttons = []
     if base_url and b["event_id"]:
-        url = f"{base_url}/web#id={b['event_id']}&model=calendar.event&view_type=form"
+        # Odoo 17+ URL scheme: the old /web#id=..&model=..&view_type=form hash no longer opens
+        # a record (SaaS 19.2 dropped hash-routing). /odoo/action-<id>/<res_id> opens the record
+        # in that action's form. NB: BACKEND links -> the tapper must be signed into Odoo.
+        url = f"{base_url}/odoo/action-650/{b['event_id']}"
         buttons.append({"text": "Open in Odoo", "onClick": {"openLink": {"url": url}}})
     if b["phone"]:
         tel = re.sub(r"[^\d+]", "", b["phone"])
