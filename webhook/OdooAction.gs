@@ -262,15 +262,29 @@ function postRescheduleCard_(uid, eid, cfg) {
   var cust = (ev.appointment_booker_id && ev.appointment_booker_id[1]) || 'Customer';
   var svc = (ev.appointment_type_id && ev.appointment_type_id[1]) || 'Booking';
   var when = fmtNZ_(ev.start);
+  var wasUtc = lastWas_(uid, eid);
+  var was = wasUtc ? fmtNZ_(wasUtc) : '';
   var widgets = [{ decoratedText: { topLabel: 'Customer', text: cust } },
                  { decoratedText: { topLabel: 'Service', text: svc } }];
+  if (was) widgets.push({ decoratedText: { topLabel: 'Was', text: was } });
+  widgets.push({ decoratedText: { topLabel: 'Now', text: when } });
   if (ev.location) widgets.push({ decoratedText: { topLabel: 'Where', text: ev.location } });
   widgets.push({ decoratedText: { topLabel: 'Detailer', text: RES_NAME[rid] || '' } });
   var payload = {
-    text: '🔁 *Rescheduled* — ' + cust + ' · ' + when + ' · ' + svc,
-    cardsV2: [{ cardId: 'resched-' + eid, card: { header: { title: '🔁 Booking rescheduled', subtitle: when }, sections: [{ widgets: widgets }] } }]
+    text: '🔁 *Rescheduled* — ' + cust + ' · ' + (was ? was + ' → ' : '') + when + ' · ' + svc,
+    cardsV2: [{ cardId: 'resched-' + eid, card: { header: { title: '🔁 Booking rescheduled', subtitle: (was ? was + '  →  ' + when : when) }, sections: [{ widgets: widgets }] } }]
   };
   UrlFetchApp.fetch(webhook, { method: 'post', contentType: 'application/json', payload: JSON.stringify(payload), muteHttpExceptions: true });
+}
+
+// the previous start (the "was" time) from the chatter tracking log (field 13908 = start)
+function lastWas_(uid, eid) {
+  try {
+    var tv = execKw_(uid, 'mail.tracking.value', 'search_read',
+      [[['mail_message_id.res_id', '=', eid], ['mail_message_id.model', '=', 'calendar.event'], ['field_id', '=', 13908]]],
+      { fields: ['old_value_datetime'], order: 'id desc', limit: 1 });
+    return (tv && tv[0] && tv[0].old_value_datetime) || '';
+  } catch (e) { return ''; }
 }
 
 // UTC 'YYYY-MM-DD HH:MM:SS' -> 'Sun 26 Jul, 9:00 am' (NZ)

@@ -27,6 +27,9 @@ from ics_invite import build_ics, sequence_now
 NZ = ZoneInfo("Pacific/Auckland")
 UTC = ZoneInfo("UTC")
 NOISE_OFF = RA.NOISE_OFF
+# the event-time write KEEPS field tracking on (so the chatter logs old->new start, which the
+# Chat reschedule card reads for its "Was ..." line) while still suppressing attendee mail.
+TRACK_CTX = {"no_mail_to_attendees": True, "mail_notify_author": False}
 FMT = "%Y-%m-%d %H:%M:%S"
 RESCHEDULE_TEMPLATE_ID = 29   # "Booking rescheduled (customer)" = confirmation duplicate (calendar.attendee);
                               # Odoo fires it natively on client/UI date changes too, so all paths match.
@@ -119,8 +122,9 @@ def main():
         if not dry:
             c.call(model, "write", ids if isinstance(ids, list) else [ids], vals, **kw)
 
-    # 1) move the event time (booking-line event_start/event_stop are related -> they follow)
-    W("calendar.event", eid, {"start": new_start_utc, "stop": new_stop_utc}, context=NOISE_OFF)
+    # 1) move the event time (booking-line event_start/event_stop are related -> they follow).
+    # Tracking stays ON here so the "Was ..." line on the Chat card has an old value to read.
+    W("calendar.event", eid, {"start": new_start_utc, "stop": new_stop_utc}, context=TRACK_CTX)
     print(f"  [1] calendar.event.start/stop -> {new_start_utc} / {new_stop_utc}{' (would)' if dry else ''}")
 
     # 2) resolve the owning order line(s) via the SDCAL token, rewrite SDBK1 date+time (+resource if lane changed)
