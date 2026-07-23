@@ -31,10 +31,18 @@ var PAY_LABEL = { bank: 'Bank transfer', cash: 'Cash' };
 function doGet(e) {
   try {
     var p = e.parameter || {};
-    // Swap accepts a static key (the staff-only /schedule page can't HMAC-sign); else verify the sig.
-    if (!(p.action === 'swap' && CFG.SWAP_KEY && p.key === CFG.SWAP_KEY)) verify_(p);
+    // Swap + reschedule accept a static key (the staff-only /schedule page can't HMAC-sign); else verify the sig.
+    if (!((p.action === 'swap' || p.action === 'reschedule') && CFG.SWAP_KEY && p.key === CFG.SWAP_KEY)) verify_(p);
     if (p.action === 'menu') return htmlMenu_(p.event);   // Change-stage menu
     if (p.action === 'paid') return htmlPayMenu_(p.event); // Mark-paid -> choose method
+    if (p.action === 'reschedule') {   // /schedule gantt drag -> move the booking's time (+ optional lane)
+      var rstart = (p.start || '').replace('T', ' ');
+      if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(rstart)) return page_('Bad reschedule time.', false);
+      var rdet = (p.detailer === 'Alex' || p.detailer === 'Kade') ? p.detailer : '';
+      dispatchReschedule_(p.event, rstart, rdet);
+      return page_('Rescheduling to <b>' + rstart + '</b>' + (rdet ? ' with <b>' + rdet + '</b>' : '') +
+                   ' — the calendar updates in a few seconds.', true);
+    }
     var uid = login_();
     if (p.action === 'swap') {   // flip Alex<->Kade -> dispatch the proven reassign_detailer.py
       var evr = execKw_(uid, 'calendar.event', 'read', [[parseInt(p.event, 10)], ['appointment_resource_ids']]);
@@ -84,6 +92,19 @@ function dispatchReassign_(eventId, detailer) {
                'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'sd-swap' },
     payload: JSON.stringify({ event_type: 'reassign-booking',
       client_payload: { event: String(eventId), detailer: detailer } }),
+    muteHttpExceptions: true
+  });
+  if (res.getResponseCode() >= 300) throw new Error('dispatch failed: ' + res.getResponseCode() + ' ' + res.getContentText());
+}
+
+// Fire the reschedule workflow (runs reschedule_booking.py — event time move + hold + SDBK1 source).
+function dispatchReschedule_(eventId, start, detailer) {
+  var res = UrlFetchApp.fetch('https://api.github.com/repos/' + CFG.GH_REPO + '/dispatches', {
+    method: 'post', contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + CFG.GH_TOKEN, Accept: 'application/vnd.github+json',
+               'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'sd-reschedule' },
+    payload: JSON.stringify({ event_type: 'reschedule-booking',
+      client_payload: { event: String(eventId), start: String(start), detailer: detailer || '' } }),
     muteHttpExceptions: true
   });
   if (res.getResponseCode() >= 300) throw new Error('dispatch failed: ' + res.getResponseCode() + ' ' + res.getContentText());

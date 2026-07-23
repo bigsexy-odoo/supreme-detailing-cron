@@ -1,0 +1,44 @@
+name: Reschedule booking
+
+# Fired by OdooAction.gs (the /schedule gantt drag) via repository_dispatch. Runs
+# reschedule_booking.py so a drag moves the calendar.event time (+ optional lane change)
+# consistently: event start/stop, the booking-line availability hold, and the SDBK1 source.
+on:
+  repository_dispatch:
+    types: [reschedule-booking]
+
+concurrency:
+  group: reschedule-${{ github.event.client_payload.event }}
+  cancel-in-progress: false
+
+jobs:
+  reschedule:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Reschedule booking
+        env:
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USER: ${{ secrets.ODOO_USER }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+          # payload via env (NOT expanded by GitHub's template engine -> no shell injection)
+          EVENT_ID: ${{ github.event.client_payload.event }}
+          START: ${{ github.event.client_payload.start }}
+          DETAILER: ${{ github.event.client_payload.detailer }}
+        run: |
+          # validate every field before use
+          case "$EVENT_ID" in ''|*[!0-9]*) echo "bad EVENT_ID"; exit 1;; esac
+          if ! printf '%s' "$START" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$'; then
+            echo "bad START (expect 'YYYY-MM-DD HH:MM'): $START"; exit 1
+          fi
+          ARGS=(--start "$START" --commit)
+          case "$DETAILER" in
+            Alex|Kade|1|2) ARGS+=(--detailer "$DETAILER");;
+            "") ;;   # no lane change
+            *) echo "bad DETAILER: $DETAILER"; exit 1;;
+          esac
+          python reschedule_booking.py "e${EVENT_ID}" "${ARGS[@]}"
