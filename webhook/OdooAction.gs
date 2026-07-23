@@ -1,27 +1,9 @@
-/**
- * OdooAction.gs — "act from Google Chat" web app for Supreme Detailing (Tier 3).
- *
- * A booking card's buttons (built by booking_card.py) open this web app with an
- * HMAC-signed, time-limited link. It resolves the booking's linked CRM
- * opportunity (calendar.event.opportunity_id) and updates its stage:
- *   • action=paid  -> stage "Booked" (6)               [Mark paid / cash in hand]
- *   • action=menu  -> a page of stage buttons
- *   • action=stage -> the chosen stage
- * Every write is HMAC-verified and logged as a chatter note on the opportunity.
- *
- * DEPLOY (see CHAT_ACTIONS_SETUP.md):
- *   1. New Apps Script project (under admin@supremedetailing.co.nz), paste this.
- *   2. Project Settings -> Script Properties: ODOO_URL, ODOO_DB, ODOO_USER,
- *      ODOO_API_KEY, SHARED_SECRET  (values in CHAT_ACTIONS_SETUP.md).
- *   3. Deploy -> New deployment -> Web app -> Execute as: Me,
- *      Who has access: Anyone -> copy the /exec URL.
- *   4. Put that URL in the cron's SD_ACTION_URL and the same SHARED_SECRET in
- *      SD_ACTION_SECRET (GitHub secrets / .env).
- *
- * The SHARED_SECRET here MUST equal SD_ACTION_SECRET on the poster side, and the
- * signing string MUST match booking_card._sign():  "action|event|stage|exp".
- */
-
+// OdooAction.gs — signed "act from Chat" web app for Supreme Detailing booking cards.
+// Tapping a card button opens this (doGet), which HMAC-verifies the signed link and writes to
+// Odoo via JSON-RPC. Config lives in Script Properties (never in code).
+//   Script Properties: ODOO_URL, ODOO_DB, ODOO_USER, ODOO_API_KEY, SHARED_SECRET
+//   SHARED_SECRET must equal the GitHub Actions secret SD_ACTION_SECRET (used by booking_card.py).
+// Signing (matches booking_card._sign): HMAC-SHA256(hex) over "action|event|stage|exp".
 var CFG = (function () {
   var p = PropertiesService.getScriptProperties();
   return {
@@ -37,24 +19,38 @@ var STAGE = { NEW: 1, BOOKED_UNPAID: 5, BOOKED: 6, WON: 4 };
 var STAGE_NAMES = { 1: 'New', 5: 'Booked (Unpaid)', 6: 'Booked', 4: 'Won' };
 var ALLOWED_STAGES = [1, 5, 6, 4];
 
-// ---------------------------------------------------------------------------
-// entry point
-// ---------------------------------------------------------------------------
+// Payment journals. NB: this Odoo has ONLY a Bank journal (id 13, BNK1) — no Cash journal —
+// so Cash currently also posts to Bank (the method is captured in the CRM note). To give cash
+// its own ledger, create a Cash journal in Odoo and set PAY_JOURNAL.cash to its id.
+var PAY_JOURNAL = { bank: 13, cash: 13 };
+var PAY_LABEL = { bank: 'Bank transfer', cash: 'Cash' };
+
 function doGet(e) {
   try {
     var p = e.parameter || {};
     verify_(p);
-    if (p.action === 'menu') return htmlMenu_(p.event);
-
+    if (p.action === 'menu') return htmlMenu_(p.event);   // Change-stage menu
+    if (p.action === 'paid') return htmlPayMenu_(p.event); // Mark-paid -> choose method
     var uid = login_();
     var oppId = resolveOpp_(uid, p.event);
-    if (!oppId) return page_('No opportunity is linked to this booking.', false);
 
-    if (p.action === 'paid') {
-      setStage_(uid, oppId, STAGE.BOOKED);
-      note_(uid, oppId, 'Marked <b>paid</b> via Google Chat.');
-      return page_('Marked paid — opportunity moved to <b>Booked</b>.', true);
+    if (p.action === 'payreg') {   // register the payment (method carried in the stage slot)
+      var method = (p.stage === 'cash') ? 'cash' : 'bank';
+      var invId = oppId ? resolveInvoice_(uid, oppId) : null;
+      if (invId) registerPayment_(uid, invId, PAY_JOURNAL[method]);
+      if (oppId) {
+        setStage_(uid, oppId, STAGE.BOOKED);
+        note_(uid, oppId, 'Marked paid (' + PAY_LABEL[method] + ') via Google Chat' +
+              (invId ? ' — invoice settled.' : ' (no open invoice found).'));
+      }
+      var msg = invId
+        ? 'Payment registered (' + PAY_LABEL[method] + ') — invoice marked <b>Paid</b> and booking moved to <b>Booked</b>.'
+        : (oppId ? 'No open invoice found — booking moved to <b>Booked</b>.'
+                 : 'No opportunity/invoice is linked to this booking.');
+      return page_(msg, true);
     }
+
+    if (!oppId) return page_('No opportunity is linked to this booking.', false);
     if (p.action === 'stage') {
       var sid = parseInt(p.stage, 10);
       if (ALLOWED_STAGES.indexOf(sid) < 0) return page_('That stage is not allowed.', false);
@@ -68,9 +64,6 @@ function doGet(e) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// security
-// ---------------------------------------------------------------------------
 function verify_(p) {
   if (!p.action || !p.event || !p.exp || !p.sig) throw new Error('missing params');
   if (Number(p.exp) < Math.floor(Date.now() / 1000)) throw new Error('this link has expired');
@@ -84,13 +77,9 @@ function hmacHex_(msg, key) {
   return raw.map(function (b) { return ('0' + (b & 0xff).toString(16)).slice(-2); }).join('');
 }
 
-// ---------------------------------------------------------------------------
-// Odoo JSON-RPC
-// ---------------------------------------------------------------------------
 function rpc_(service, method, args) {
   var url = CFG.ODOO_URL.replace(/\/+$/, '') + '/jsonrpc';
-  var payload = { jsonrpc: '2.0', method: 'call',
-                  params: { service: service, method: method, args: args } };
+  var payload = { jsonrpc: '2.0', method: 'call', params: { service: service, method: method, args: args } };
   var res = UrlFetchApp.fetch(url, {
     method: 'post', contentType: 'application/json',
     payload: JSON.stringify(payload), muteHttpExceptions: true
@@ -100,13 +89,10 @@ function rpc_(service, method, args) {
   return data.result;
 }
 
-function login_() {
-  return rpc_('common', 'login', [CFG.ODOO_DB, CFG.ODOO_USER, CFG.ODOO_API_KEY]);
-}
+function login_() { return rpc_('common', 'login', [CFG.ODOO_DB, CFG.ODOO_USER, CFG.ODOO_API_KEY]); }
 
 function execKw_(uid, model, method, args, kwargs) {
-  return rpc_('object', 'execute_kw',
-              [CFG.ODOO_DB, uid, CFG.ODOO_API_KEY, model, method, args, kwargs || {}]);
+  return rpc_('object', 'execute_kw', [CFG.ODOO_DB, uid, CFG.ODOO_API_KEY, model, method, args, kwargs || {}]);
 }
 
 function resolveOpp_(uid, eventId) {
@@ -115,20 +101,53 @@ function resolveOpp_(uid, eventId) {
   return null;
 }
 
-function setStage_(uid, oppId, stageId) {
-  execKw_(uid, 'crm.lead', 'write', [[oppId], { stage_id: stageId }]);
+// opp -> its sale orders -> the first POSTED, still-owing customer invoice (skip already-paid,
+// so tapping Mark-paid twice never double-pays).
+function resolveInvoice_(uid, oppId) {
+  var opp = execKw_(uid, 'crm.lead', 'read', [[oppId], ['order_ids']]);
+  if (!opp || !opp[0] || !opp[0].order_ids || !opp[0].order_ids.length) return null;
+  var orders = execKw_(uid, 'sale.order', 'read', [opp[0].order_ids, ['invoice_ids']]);
+  var invIds = [];
+  orders.forEach(function (o) { if (o.invoice_ids && o.invoice_ids.length) invIds = invIds.concat(o.invoice_ids); });
+  if (!invIds.length) return null;
+  var moves = execKw_(uid, 'account.move', 'read', [invIds, ['move_type', 'state', 'payment_state', 'amount_residual']]);
+  for (var i = 0; i < moves.length; i++) {
+    var m = moves[i];
+    if (m.move_type === 'out_invoice' && m.state === 'posted' && m.amount_residual > 0 &&
+        m.payment_state !== 'paid' && m.payment_state !== 'in_payment') {
+      return m.id;
+    }
+  }
+  return null;
 }
+
+// Register a full Manual payment for the invoice via the standard account.payment.register
+// wizard (amount defaults to the residual, auto-reconciled -> invoice flips to Paid/In Payment).
+function registerPayment_(uid, invoiceId, journalId) {
+  var ctx = { active_ids: [invoiceId], active_model: 'account.move' };
+  var wizId = execKw_(uid, 'account.payment.register', 'create', [{ journal_id: journalId }], { context: ctx });
+  if (Array.isArray(wizId)) wizId = wizId[0];
+  execKw_(uid, 'account.payment.register', 'action_create_payments', [[wizId]], { context: ctx });
+}
+
+function setStage_(uid, oppId, stageId) { execKw_(uid, 'crm.lead', 'write', [[oppId], { stage_id: stageId }]); }
 
 function note_(uid, oppId, body) {
-  try {
-    execKw_(uid, 'crm.lead', 'message_post', [[oppId]],
-            { body: body, message_type: 'comment' });
-  } catch (e) { /* audit note is best-effort */ }
+  try { execKw_(uid, 'crm.lead', 'message_post', [[oppId]], { body: body, message_type: 'comment' }); } catch (e) {}
 }
 
-// ---------------------------------------------------------------------------
-// HTML
-// ---------------------------------------------------------------------------
+// Mark-paid -> choose how they paid (both post to the Bank journal until a Cash journal exists).
+function htmlPayMenu_(eventId) {
+  var exp = Math.floor(Date.now() / 1000) + 3600;
+  var base = ScriptApp.getService().getUrl();
+  var btns = [['bank', '🏦 Bank transfer'], ['cash', '💵 Cash']].map(function (m) {
+    var sig = hmacHex_('payreg|' + eventId + '|' + m[0] + '|' + exp, CFG.SHARED_SECRET);
+    var url = base + '?action=payreg&event=' + eventId + '&stage=' + m[0] + '&exp=' + exp + '&sig=' + sig;
+    return '<a class="btn" href="' + url + '">' + m[1] + '</a>';
+  }).join('');
+  return page_('<div class="h">Mark paid — how did they pay?</div>' + btns, true, true);
+}
+
 function htmlMenu_(eventId) {
   var exp = Math.floor(Date.now() / 1000) + 3600;
   var base = ScriptApp.getService().getUrl();
@@ -148,10 +167,8 @@ function page_(msg, ok, isMenu) {
     '<style>' +
     'body{font-family:Questrial,Helvetica,Arial,sans-serif;background:#F5F2F0;margin:0;padding:40px 16px;text-align:center;color:#2E1F14}' +
     '.card{max-width:420px;margin:0 auto;background:#fff;border-radius:16px;padding:32px 24px;box-shadow:0 8px 30px rgba(0,0,0,.08);border-top:6px solid ' + colour + '}' +
-    '.i{font-size:44px;line-height:1}' +
-    '.h{font-weight:700;font-size:18px;margin:12px 0}' +
-    'p{font-size:16px;line-height:1.5}' +
-    '.btn{display:block;margin:10px 0;padding:12px 16px;background:' + '#E17726' + ';color:#fff;text-decoration:none;border-radius:10px;font-weight:600}' +
+    '.i{font-size:44px;line-height:1}.h{font-weight:700;font-size:18px;margin:12px 0}p{font-size:16px;line-height:1.5}' +
+    '.btn{display:block;margin:10px 0;padding:12px 16px;background:#E17726;color:#fff;text-decoration:none;border-radius:10px;font-weight:600}' +
     '.foot{margin-top:20px;font-size:12px;color:#A1A1A1}' +
     '</style></head><body><div class="card">' +
     '<div class="i">' + icon + '</div><p>' + msg + '</p>' +
