@@ -320,20 +320,35 @@ def summary_text(detailer_name, date_display, bookings):
     return f"📋 {det} — Summary for {date_display} · " + " · ".join(bits)
 
 
-def day_message(text, bookings, base_url=""):
-    """One Chat message: a pre-built notification line + one card PER booking."""
-    return {
-        "text": text,
-        "cardsV2": [booking_card(b, base_url) for b in bookings],
-    }
+def _schedule_card(url):
+    """A trailing card with one 'Open schedule (gantt)' button. None if no url."""
+    if not url:
+        return None
+    return {"cardId": "sd-open-schedule",
+            "card": {"sections": [{"widgets": [{"buttonList": {"buttons": [
+                {"text": "📅 Open schedule (gantt)", "onClick": {"openLink": {"url": url}}}]}}]}]}}
 
 
-def no_jobs_message(detailer_name, date_display):
+def day_message(text, bookings, base_url="", schedule_url=None):
+    """One Chat message: a pre-built notification line + one card PER booking
+    (+ a trailing 'Open schedule' button that jumps to the resource gantt)."""
+    cards = [booking_card(b, base_url) for b in bookings]
+    sc = _schedule_card(schedule_url)
+    if sc:
+        cards.append(sc)
+    return {"text": text, "cardsV2": cards}
+
+
+def no_jobs_message(detailer_name, date_display, schedule_url=None):
     det = _short_detailer(detailer_name) or detailer_name
     title = f"{det} — {date_display}"
+    widgets = [{"textParagraph": {"text": "Enjoy the day off. 🚗✨"}}]
+    if schedule_url:
+        widgets.append({"buttonList": {"buttons": [
+            {"text": "📅 Open schedule (gantt)", "onClick": {"openLink": {"url": schedule_url}}}]}})
     return {
         "text": f"📋 {det} — Summary for {date_display} · No jobs scheduled ✅",
         "cardsV2": [{"cardId": re.sub(r"[^a-zA-Z0-9]+", "-", title)[:60],
                      "card": {"header": {"title": title, "subtitle": "No jobs scheduled ✅"},
-                              "sections": [{"widgets": [{"textParagraph": {"text": "Enjoy the day off. 🚗✨"}}]}]}}],
+                              "sections": [{"widgets": widgets}]}}],
     }

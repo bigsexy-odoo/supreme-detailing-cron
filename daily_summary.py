@@ -242,6 +242,9 @@ def main():
 
     c = OdooClient()
     print(f"    Connected to {c.url} as uid={c.uid}")
+    # "Open schedule" button target = the native Resource Bookings gantt (gantt-first,
+    # Alex/Kade lanes = availability). Opens straight to the gantt on tap.
+    SCHEDULE_URL = f"{c.url}/odoo/action-650"
 
     # Lookups for rich-card gathering (shared with enrich_calendar_events)
     answer_labels = E.fetch_answer_labels(c)
@@ -286,9 +289,9 @@ def main():
                 for b in bookings:
                     b["action_buttons"] = BC.action_buttons(b["event_id"], act_url, act_secret)
             text = BC.summary_text(resource_name, date_display, bookings)
-            payload = BC.day_message(text, bookings, c.url)
+            payload = BC.day_message(text, bookings, c.url, schedule_url=SCHEDULE_URL)
         else:
-            payload = BC.no_jobs_message(resource_name, date_display)
+            payload = BC.no_jobs_message(resource_name, date_display, schedule_url=SCHEDULE_URL)
 
         print(f"\n  --- {resource_name} ({len(resource_events)} jobs) ---")
         print(f"  {payload.get('text')}")
