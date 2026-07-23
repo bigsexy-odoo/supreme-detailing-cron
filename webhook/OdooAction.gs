@@ -22,7 +22,7 @@ var ALLOWED_STAGES = [1, 5, 6, 4];
 // Payment journals. NB: this Odoo has ONLY a Bank journal (id 13, BNK1) — no Cash journal —
 // so Cash currently also posts to Bank (the method is captured in the CRM note). To give cash
 // its own ledger, create a Cash journal in Odoo and set PAY_JOURNAL.cash to its id.
-var PAY_JOURNAL = { bank: 13, cash: 13 };
+var PAY_JOURNAL = { bank: 13, cash: 15 };   // Bank (BNK1) + Cash (CSH1) — report separately
 var PAY_LABEL = { bank: 'Bank transfer', cash: 'Cash' };
 
 function doGet(e) {
