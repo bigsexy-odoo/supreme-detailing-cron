@@ -25,5 +25,11 @@ jobs:
           ODOO_DB: ${{ secrets.ODOO_DB }}
           ODOO_USER: ${{ secrets.ODOO_USER }}
           ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+          # payload via env (shell vars are NOT expanded by GitHub's template engine -> no injection)
+          EVENT_ID: ${{ github.event.client_payload.event }}
+          DETAILER: ${{ github.event.client_payload.detailer }}
         run: |
-          python reassign_detailer.py "e${{ github.event.client_payload.event }}" "${{ github.event.client_payload.detailer }}" --commit
+          # validate before use: event = digits only, detailer = a known name
+          case "$EVENT_ID" in ''|*[!0-9]*) echo "bad EVENT_ID"; exit 1;; esac
+          case "$DETAILER" in Alex|Kade|1|2) ;; *) echo "bad DETAILER"; exit 1;; esac
+          python reassign_detailer.py "e${EVENT_ID}" "${DETAILER}" --commit
