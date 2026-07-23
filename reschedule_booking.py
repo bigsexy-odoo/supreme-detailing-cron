@@ -21,6 +21,8 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from odoo_client import OdooClient
 import reassign_detailer as RA   # reuse constants + resolvers (don't duplicate the proven bits)
+import base64
+from ics_invite import build_ics, sequence_now
 
 NZ = ZoneInfo("Pacific/Auckland")
 UTC = ZoneInfo("UTC")
@@ -173,13 +175,37 @@ def main():
             W("calendar.event", eid, {"description": newdesc}, context=NOISE_OFF)
             print(f"  [3] description Detailer -> {RA.RESOURCE_NAME[rid]}{' (would)' if dry else ''}")
 
-    # notify the customer of the new time (branded template -> booker); queue, not force-send
+    # notify the customer of the new time: branded email + an updated .ics so their OWN
+    # calendar moves the existing entry (same stable UID). Queue, not force-send.
     if not dry and not args.no_notify:
         try:
-            c.call("mail.template", "send_mail", [RESCHEDULE_TEMPLATE_ID], eid, force_send=False)
-            print("  [email] queued 'Booking rescheduled' to the booker")
+            info = c.call("calendar.event", "read", [eid],
+                          fields=["appointment_type_id", "location", "appointment_booker_id", "user_id"])[0]
+            svc = info["appointment_type_id"][1] if info.get("appointment_type_id") else "Booking"
+            summary = f"Supreme Detailing — {svc}"
+            loc = info.get("location") or ""
+            booker = info.get("appointment_booker_id") or [None, ""]
+            bemail = ""
+            if booker[0]:
+                bemail = (c.call("res.partner", "read", [booker[0]], fields=["email"])[0].get("email")) or ""
+            org = info.get("user_id") or [None, "Supreme Detailing"]
+            org_email = "admin@supremedetailing.co.nz"
+            if org[0]:
+                org_email = (c.call("res.users", "read", [org[0]], fields=["email"])[0].get("email")) or org_email
+            att_vals = {}
+            if bemail:
+                ics = build_ics(eid, summary, new_start_utc, new_stop_utc, loc, sequence_now(),
+                                org_email, org[1] or "Supreme Detailing", bemail, booker[1] or "there")
+                aid = c.call("ir.attachment", "create", [{
+                    "name": "invite.ics", "type": "binary", "mimetype": "text/calendar",
+                    "datas": base64.b64encode(ics.encode("utf-8")).decode("ascii")}])
+                aid = aid[0] if isinstance(aid, list) else aid
+                att_vals = {"attachment_ids": [(6, 0, [aid])]}
+            c.call("mail.template", "send_mail", [RESCHEDULE_TEMPLATE_ID], eid,
+                   force_send=False, email_values=att_vals)
+            print(f"  [email] queued reschedule email{' + updated .ics invite' if att_vals else ' (no booker email -> no .ics)'}")
         except Exception as e:
-            print(f"  [email] WARN could not queue reschedule email: {repr(e)[:160]}")
+            print(f"  [email] WARN could not queue reschedule email: {repr(e)[:180]}")
 
     print(f"\nDONE{' (dry-run — pass --commit)' if dry else ' (committed)'}")
 
