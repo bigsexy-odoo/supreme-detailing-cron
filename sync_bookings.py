@@ -308,6 +308,26 @@ def parse_sdbk1(raw):
         return None
 
 
+# --- Native Vehicle-size (Q5) answer, written at event creation (handoff 2026-07-23) ---
+# Size comes straight from the SDBK service_label's parenthesised token ("... (Car)" -> Car).
+# Stored as the native Q5 answer (NOT a custom/Studio field), so it keeps billable LoC at zero
+# and surfaces in Odoo's appointment views/emails + the staff /schedule page.
+Q_VEHICLE_SIZE = 5
+SIZE_ANSWER = {"car": 16, "station wagon": 17, "sw": 17, "suv": 18,
+               "van": 19, "truck": 20, "ute": 20, "truck / ute": 20}
+
+
+def size_answer_cmd(service_label, appt_type_id):
+    """(0,0,{...}) ORM create-command for the Q5 vehicle-size answer, or None if no size token.
+    Size = the parenthesised token in the service label ('... (Car)' -> Car)."""
+    for tok in re.findall(r"\(([^)]+)\)", service_label or ""):
+        aid = SIZE_ANSWER.get(tok.strip().lower())
+        if aid:
+            return (0, 0, {"question_id": Q_VEHICLE_SIZE, "value_answer_id": aid,
+                           "question_type": "select", "appointment_type_id": appt_type_id})
+    return None
+
+
 def resolve_resource(name):
     """Match a booked resource NAME to an appointment.resource id.
 
@@ -1099,6 +1119,7 @@ def process(rec, writer):
         return "would-create"
 
     # --- Create the event (mirror event 2) ---
+    size_cmd = size_answer_cmd(sdbk["service_label"], sdbk["appt_type_id"])
     vals = {
         "name": ename,
         "start": start_utc,
@@ -1130,6 +1151,8 @@ def process(rec, writer):
         "videocall_location": False,
         "description": build_description(sdbk, resource_name, lid, order),
     }
+    if size_cmd:   # native Vehicle-size (Q5) answer, so Odoo views/emails + /schedule show it
+        vals["appointment_answer_input_ids"] = [size_cmd]
     event_id = C.call("calendar.event", "create", vals, context=NOISE_OFF)
     if isinstance(event_id, (list, tuple)):
         event_id = event_id[0]
