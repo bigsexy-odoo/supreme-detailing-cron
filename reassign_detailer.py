@@ -107,21 +107,24 @@ def main():
         ev = ev[0]
         print(f"\n  event {eid} '{ev['name']}'  resource={ev.get('appointment_resource_ids')}  attendees={ev['partner_ids']}")
 
-        # 1) resource / lane
-        if (ev.get("appointment_resource_ids") or []) != [rid]:
+        # 1+2) RESOURCE via the booking-line (the capacity carrier + availability hold).
+        # Writing the event's appointment_resource_ids m2m DIRECTLY errors
+        # "Missing required value ... capacity_reserved" (the same lesson sync_bookings' create
+        # documents) — so update the booking line (carrying capacity) and the m2m follows.
+        bls = ev.get("booking_line_ids", [])
+        if bls and BLM:
+            for bl in bls:
+                cap = c.call(BLM, "read", [bl], fields=["capacity_reserved", "capacity_used"])
+                cap = cap[0] if cap else {}
+                W(BLM, bl, {"appointment_resource_id": rid,
+                            "capacity_reserved": cap.get("capacity_reserved") or 1,
+                            "capacity_used": cap.get("capacity_used") or 1})
+                print(f"    [1] {BLM} {bl}.appointment_resource_id -> {rid} (+capacity){' (would)' if dry else ''}")
+        elif (ev.get("appointment_resource_ids") or []) != [rid]:
             W("calendar.event", eid, {"appointment_resource_ids": [(6, 0, [rid])]}, context=NOISE_OFF)
-            print(f"    [1] resource -> [{rid}]{' (would)' if dry else ''}")
+            print(f"    [1] resource m2m -> [{rid}] (no booking line){' (would)' if dry else ''}")
         else:
             print("    [1] resource already correct")
-
-        # 2) booking-line hold (the availability reservation)
-        for bl in ev.get("booking_line_ids", []):
-            if BLM:
-                try:
-                    W(BLM, bl, {"appointment_resource_id": rid})
-                    print(f"    [2] {BLM} {bl}.appointment_resource_id -> {rid}{' (would)' if dry else ''}")
-                except Exception as e:
-                    print(f"    [2] booking-line {bl} write FAILED: {str(e)[:90]}")
 
         # 3) attendee / colour  (add new detailer, strip the other)
         drop = [p for p in old_pids if p in ev["partner_ids"]]
