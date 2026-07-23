@@ -273,12 +273,11 @@ def booking_card(b, base_url=""):
         widgets.append(_row("Detailer", b["detailer"]))   # repeated in body, as requested
 
     buttons = []
-    if base_url and b["event_id"]:
-        # Odoo 17+ URL scheme: the old /web#id=..&model=..&view_type=form hash no longer opens
-        # a record (SaaS 19.2 dropped hash-routing). /odoo/action-<id>/<res_id> opens the record
-        # in that action's form. NB: BACKEND links -> the tapper must be signed into Odoo.
-        url = f"{base_url}/odoo/action-650/{b['event_id']}"
-        buttons.append({"text": "Open in Odoo", "onClick": {"openLink": {"url": url}}})
+    # 'Open in Odoo' button DROPPED 2026-07-23: bookings will be viewable on the new PUBLIC
+    # QWeb gantt page (no Odoo backend login), so a /web backend deep-link is redundant. The
+    # 'Open schedule (gantt)' button (see day_message) will be repointed at that page once it's
+    # live; until then it still lands on the Odoo backend login. (base_url kept in the signature
+    # for callers / future use.)
     if b["phone"]:
         tel = re.sub(r"[^\d+]", "", b["phone"])
         buttons.append({"text": "📞 Call", "onClick": {"openLink": {"url": f"tel:{tel}"}}})
