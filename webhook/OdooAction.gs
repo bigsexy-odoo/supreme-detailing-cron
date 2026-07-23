@@ -11,7 +11,10 @@ var CFG = (function () {
     ODOO_DB: p.getProperty('ODOO_DB'),
     ODOO_USER: p.getProperty('ODOO_USER'),
     ODOO_API_KEY: p.getProperty('ODOO_API_KEY'),
-    SHARED_SECRET: p.getProperty('SHARED_SECRET')
+    SHARED_SECRET: p.getProperty('SHARED_SECRET'),
+    SWAP_KEY: p.getProperty('SWAP_KEY'),      // static key for the /schedule page swap link
+    GH_TOKEN: p.getProperty('GH_TOKEN'),      // PAT (Actions: read/write on the cron repo) for dispatch
+    GH_REPO: 'bigsexy-odoo/supreme-detailing-cron'
   };
 })();
 
@@ -28,10 +31,19 @@ var PAY_LABEL = { bank: 'Bank transfer', cash: 'Cash' };
 function doGet(e) {
   try {
     var p = e.parameter || {};
-    verify_(p);
+    // Swap accepts a static key (the staff-only /schedule page can't HMAC-sign); else verify the sig.
+    if (!(p.action === 'swap' && CFG.SWAP_KEY && p.key === CFG.SWAP_KEY)) verify_(p);
     if (p.action === 'menu') return htmlMenu_(p.event);   // Change-stage menu
     if (p.action === 'paid') return htmlPayMenu_(p.event); // Mark-paid -> choose method
     var uid = login_();
+    if (p.action === 'swap') {   // flip Alex<->Kade -> dispatch the proven reassign_detailer.py
+      var evr = execKw_(uid, 'calendar.event', 'read', [[parseInt(p.event, 10)], ['appointment_resource_ids']]);
+      var cur = (evr && evr[0] && evr[0].appointment_resource_ids && evr[0].appointment_resource_ids[0]) || 0;
+      if (cur !== 1 && cur !== 2) return page_('This booking has no Alex/Kade lane to swap.', false);
+      var toName = (cur === 1) ? 'Kade' : 'Alex';   // 1=Alex, 2=Kade -> the other
+      dispatchReassign_(p.event, toName);
+      return page_('Swapping this booking to <b>' + toName + '</b> — the calendar updates in a few seconds.', true);
+    }
     var oppId = resolveOpp_(uid, p.event);
 
     if (p.action === 'payreg') {   // register the payment (method carried in the stage slot)
@@ -62,6 +74,19 @@ function doGet(e) {
   } catch (err) {
     return page_('Error: ' + (err && err.message ? err.message : err), false);
   }
+}
+
+// Fire the reassign workflow (runs reassign_detailer.py — all 5 places, idempotent).
+function dispatchReassign_(eventId, detailer) {
+  var res = UrlFetchApp.fetch('https://api.github.com/repos/' + CFG.GH_REPO + '/dispatches', {
+    method: 'post', contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + CFG.GH_TOKEN, Accept: 'application/vnd.github+json',
+               'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'sd-swap' },
+    payload: JSON.stringify({ event_type: 'reassign-booking',
+      client_payload: { event: String(eventId), detailer: detailer } }),
+    muteHttpExceptions: true
+  });
+  if (res.getResponseCode() >= 300) throw new Error('dispatch failed: ' + res.getResponseCode() + ' ' + res.getContentText());
 }
 
 function verify_(p) {

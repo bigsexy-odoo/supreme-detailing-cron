@@ -232,6 +232,7 @@ def action_buttons(event_id, action_url, secret, ttl_days=7):
     return [
         {"text": "✅ Mark paid", "onClick": {"openLink": {"url": link("paid")}}},
         {"text": "📋 Change stage", "onClick": {"openLink": {"url": link("menu")}}},
+        {"text": "🔁 Swap detailer", "onClick": {"openLink": {"url": link("swap")}}},
     ]
 
 

@@ -1,0 +1,29 @@
+name: Reassign booking detailer
+
+# Fired by OdooAction.gs (the Chat card / schedule-page "🔁 Swap detailer" button) via
+# repository_dispatch. Runs the proven reassign_detailer.py so a swap updates ALL 5 places
+# (lane, booking-line hold, attendee/colour, title+description, SDBK1 source) consistently.
+on:
+  repository_dispatch:
+    types: [reassign-booking]
+
+concurrency:
+  group: reassign-${{ github.event.client_payload.event }}
+  cancel-in-progress: false
+
+jobs:
+  reassign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Reassign detailer
+        env:
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USER: ${{ secrets.ODOO_USER }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+        run: |
+          python reassign_detailer.py "e${{ github.event.client_payload.event }}" "${{ github.event.client_payload.detailer }}" --commit
