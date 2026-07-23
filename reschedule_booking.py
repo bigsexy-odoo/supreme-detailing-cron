@@ -30,7 +30,6 @@ NOISE_OFF = RA.NOISE_OFF
 FMT = "%Y-%m-%d %H:%M:%S"
 RESCHEDULE_TEMPLATE_ID = 29   # "Booking rescheduled (customer)" = confirmation duplicate (calendar.attendee);
                               # Odoo fires it natively on client/UI date changes too, so all paths match.
-CHAT_WEBHOOK_ENV = {1: "GCHAT_NORTH_WEBHOOK", 2: "GCHAT_CENTRAL_WEBHOOK"}   # Alex=North, Kade=Central
 
 # SDBK1|date|time|dur|apptType|resource|suburb|service  -> rewrite field 2 (date) + 3 (time)
 SDBK1_DT = re.compile(r"(SDBK1\|)([^|]*)(\|)([^|]*)(\|)")
@@ -184,12 +183,8 @@ def main():
         loc = info.get("location") or ""
         booker = info.get("appointment_booker_id") or [None, ""]
         bpid, bname = booker[0], (booker[1] or "there")
-        nz = utc_to_nz(new_start_utc)
-        when = f"{['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][nz.weekday()]} {nz.day} " \
-               f"{['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][nz.month-1]}, " \
-               f"{(nz.hour%12) or 12}:{nz.minute:02d}{'am' if nz.hour<12 else 'pm'}"
 
-        # (a) customer email = the confirmation-duplicate template (29) to the booker's ATTENDEE + .ics
+        # customer email = the confirmation-duplicate template (29) to the booker's ATTENDEE + .ics
         try:
             bemail = (c.call("res.partner", "read", [bpid], fields=["email"])[0].get("email")) or "" if bpid else ""
             org = info.get("user_id") or [None, "Supreme Detailing"]
@@ -214,28 +209,9 @@ def main():
                 print(f"  [email] queued reschedule email to booker{' + .ics' if ev_vals else ''}")
         except Exception as e:
             print(f"  [email] WARN could not queue reschedule email: {repr(e)[:180]}")
-
-        # (b) Chat card to the relevant detailer's space (Alex=North / Kade=Central)
-        try:
-            from chat_poster import post_payload
-            wurl = os.environ.get(CHAT_WEBHOOK_ENV.get(rid, ""))
-            if not wurl:
-                print(f"  [chat] {CHAT_WEBHOOK_ENV.get(rid)} not set — skipped")
-            else:
-                det = RA.RESOURCE_NAME.get(rid, "")
-                widgets = [{"decoratedText": {"topLabel": "Customer", "text": bname}},
-                           {"decoratedText": {"topLabel": "Service", "text": svc}}]
-                if loc:
-                    widgets.append({"decoratedText": {"topLabel": "Where", "text": loc}})
-                widgets.append({"decoratedText": {"topLabel": "Detailer", "text": det}})
-                payload = {"text": f"🔁 *Rescheduled* — {bname} · {when} · {svc}",
-                           "cardsV2": [{"cardId": f"resched-{eid}",
-                                        "card": {"header": {"title": "🔁 Booking rescheduled", "subtitle": when},
-                                                 "sections": [{"widgets": widgets}]}}]}
-                post_payload(payload, wurl)
-                print(f"  [chat] posted reschedule card to {CHAT_WEBHOOK_ENV[rid]}")
-        except Exception as e:
-            print(f"  [chat] WARN: {repr(e)[:160]}")
+        # NB: the detailer Chat card is posted by the Odoo base.automation on calendar.event
+        # start-change (webhook -> OdooAction.gs doPost) so ALL paths (drag/customer/UI) post
+        # exactly once. Do NOT post it here too.
 
     print(f"\nDONE{' (dry-run — pass --commit)' if dry else ' (committed)'}")
 

@@ -222,3 +222,65 @@ function page_(msg, ok, isMenu) {
     '</div></body></html>';
   return HtmlService.createHtmlOutput(html).setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
+
+// ===== Reschedule -> Chat (webhook reshaper) =========================================
+// The base.automation on calendar.event (start written on a booking) POSTs here. We read the
+// event, work out the detailer, and post a "Rescheduled" card to that detailer's Chat space.
+// Covers ALL reschedule paths (customer portal, staff UI, and the /schedule drag) with one card.
+var RES_NAME = { 1: 'Alex (North Shore)', 2: 'Kade (Central Auckland)' };
+
+function doPost(e) {
+  try {
+    var p = (e && e.parameter) || {};
+    var uid = login_();
+    var cfg = getConfig_(uid, ['sd.reschedule_key', 'sd.gchat_north', 'sd.gchat_central']);
+    if (!cfg['sd.reschedule_key'] || p.key !== cfg['sd.reschedule_key']) return _jsonOut({ ok: false, error: 'unauthorised' });
+    var body = {};
+    try { body = JSON.parse((e && e.postData && e.postData.contents) || '{}'); } catch (_) {}
+    var eid = parseInt(body._id || (body[0] && body[0]._id) || p.event, 10);
+    if (!eid) return _jsonOut({ ok: false, error: 'no event id' });
+    postRescheduleCard_(uid, eid, cfg);
+    return _jsonOut({ ok: true, event: eid });
+  } catch (err) {
+    return _jsonOut({ ok: false, error: String((err && err.message) || err) });
+  }
+}
+
+function getConfig_(uid, keys) {
+  var rows = execKw_(uid, 'ir.config_parameter', 'search_read', [[['key', 'in', keys]]], { fields: ['key', 'value'] });
+  var out = {}; (rows || []).forEach(function (r) { out[r.key] = r.value; }); return out;
+}
+
+function postRescheduleCard_(uid, eid, cfg) {
+  var ev = execKw_(uid, 'calendar.event', 'read',
+    [[eid], ['appointment_resource_ids', 'appointment_booker_id', 'appointment_type_id', 'start', 'location']]);
+  if (!ev || !ev[0]) return;
+  ev = ev[0];
+  var rid = (ev.appointment_resource_ids && ev.appointment_resource_ids[0]) || 0;
+  var webhook = (rid === 1) ? cfg['sd.gchat_north'] : (rid === 2) ? cfg['sd.gchat_central'] : '';
+  if (!webhook) return;
+  var cust = (ev.appointment_booker_id && ev.appointment_booker_id[1]) || 'Customer';
+  var svc = (ev.appointment_type_id && ev.appointment_type_id[1]) || 'Booking';
+  var when = fmtNZ_(ev.start);
+  var widgets = [{ decoratedText: { topLabel: 'Customer', text: cust } },
+                 { decoratedText: { topLabel: 'Service', text: svc } }];
+  if (ev.location) widgets.push({ decoratedText: { topLabel: 'Where', text: ev.location } });
+  widgets.push({ decoratedText: { topLabel: 'Detailer', text: RES_NAME[rid] || '' } });
+  var payload = {
+    text: '🔁 *Rescheduled* — ' + cust + ' · ' + when + ' · ' + svc,
+    cardsV2: [{ cardId: 'resched-' + eid, card: { header: { title: '🔁 Booking rescheduled', subtitle: when }, sections: [{ widgets: widgets }] } }]
+  };
+  UrlFetchApp.fetch(webhook, { method: 'post', contentType: 'application/json', payload: JSON.stringify(payload), muteHttpExceptions: true });
+}
+
+// UTC 'YYYY-MM-DD HH:MM:SS' -> 'Sun 26 Jul, 9:00 am' (NZ)
+function fmtNZ_(utc) {
+  var m = /(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/.exec(utc || '');
+  if (!m) return utc || '';
+  var d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]));
+  return Utilities.formatDate(d, 'Pacific/Auckland', 'EEE d MMM, h:mm a');
+}
+
+function _jsonOut(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
