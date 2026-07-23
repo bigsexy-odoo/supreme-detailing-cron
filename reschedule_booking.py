@@ -26,6 +26,7 @@ NZ = ZoneInfo("Pacific/Auckland")
 UTC = ZoneInfo("UTC")
 NOISE_OFF = RA.NOISE_OFF
 FMT = "%Y-%m-%d %H:%M:%S"
+RESCHEDULE_TEMPLATE_ID = 76   # "Booking rescheduled" mail.template (calendar.event -> booker)
 
 # SDBK1|date|time|dur|apptType|resource|suburb|service  -> rewrite field 2 (date) + 3 (time)
 SDBK1_DT = re.compile(r"(SDBK1\|)([^|]*)(\|)([^|]*)(\|)")
@@ -53,6 +54,7 @@ def main():
     ap.add_argument("--detailer", default="", help="Alex | Kade | 1 | 2  (only if the lane changed)")
     ap.add_argument("--commit", action="store_true", help="write (default is dry-run)")
     ap.add_argument("--force", action="store_true", help="reschedule even if it overlaps another job")
+    ap.add_argument("--no-notify", action="store_true", help="do NOT email the customer the new time")
     args = ap.parse_args()
     dry = not args.commit
     c = OdooClient()
@@ -170,6 +172,14 @@ def main():
         if newdesc != desc:
             W("calendar.event", eid, {"description": newdesc}, context=NOISE_OFF)
             print(f"  [3] description Detailer -> {RA.RESOURCE_NAME[rid]}{' (would)' if dry else ''}")
+
+    # notify the customer of the new time (branded template -> booker); queue, not force-send
+    if not dry and not args.no_notify:
+        try:
+            c.call("mail.template", "send_mail", [RESCHEDULE_TEMPLATE_ID], eid, force_send=False)
+            print("  [email] queued 'Booking rescheduled' to the booker")
+        except Exception as e:
+            print(f"  [email] WARN could not queue reschedule email: {repr(e)[:160]}")
 
     print(f"\nDONE{' (dry-run — pass --commit)' if dry else ' (committed)'}")
 
