@@ -28,7 +28,9 @@ NZ = ZoneInfo("Pacific/Auckland")
 UTC = ZoneInfo("UTC")
 NOISE_OFF = RA.NOISE_OFF
 FMT = "%Y-%m-%d %H:%M:%S"
-RESCHEDULE_TEMPLATE_ID = 76   # "Booking rescheduled" mail.template (calendar.event -> booker)
+RESCHEDULE_TEMPLATE_ID = 29   # "Booking rescheduled (customer)" = confirmation duplicate (calendar.attendee);
+                              # Odoo fires it natively on client/UI date changes too, so all paths match.
+CHAT_WEBHOOK_ENV = {1: "GCHAT_NORTH_WEBHOOK", 2: "GCHAT_CENTRAL_WEBHOOK"}   # Alex=North, Kade=Central
 
 # SDBK1|date|time|dur|apptType|resource|suburb|service  -> rewrite field 2 (date) + 3 (time)
 SDBK1_DT = re.compile(r"(SDBK1\|)([^|]*)(\|)([^|]*)(\|)")
@@ -175,37 +177,65 @@ def main():
             W("calendar.event", eid, {"description": newdesc}, context=NOISE_OFF)
             print(f"  [3] description Detailer -> {RA.RESOURCE_NAME[rid]}{' (would)' if dry else ''}")
 
-    # notify the customer of the new time: branded email + an updated .ics so their OWN
-    # calendar moves the existing entry (same stable UID). Queue, not force-send.
     if not dry and not args.no_notify:
+        info = c.call("calendar.event", "read", [eid],
+                      fields=["appointment_type_id", "location", "appointment_booker_id", "user_id"])[0]
+        svc = info["appointment_type_id"][1] if info.get("appointment_type_id") else "Booking"
+        loc = info.get("location") or ""
+        booker = info.get("appointment_booker_id") or [None, ""]
+        bpid, bname = booker[0], (booker[1] or "there")
+        nz = utc_to_nz(new_start_utc)
+        when = f"{['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][nz.weekday()]} {nz.day} " \
+               f"{['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][nz.month-1]}, " \
+               f"{(nz.hour%12) or 12}:{nz.minute:02d}{'am' if nz.hour<12 else 'pm'}"
+
+        # (a) customer email = the confirmation-duplicate template (29) to the booker's ATTENDEE + .ics
         try:
-            info = c.call("calendar.event", "read", [eid],
-                          fields=["appointment_type_id", "location", "appointment_booker_id", "user_id"])[0]
-            svc = info["appointment_type_id"][1] if info.get("appointment_type_id") else "Booking"
-            summary = f"Supreme Detailing — {svc}"
-            loc = info.get("location") or ""
-            booker = info.get("appointment_booker_id") or [None, ""]
-            bemail = ""
-            if booker[0]:
-                bemail = (c.call("res.partner", "read", [booker[0]], fields=["email"])[0].get("email")) or ""
+            bemail = (c.call("res.partner", "read", [bpid], fields=["email"])[0].get("email")) or "" if bpid else ""
             org = info.get("user_id") or [None, "Supreme Detailing"]
             org_email = "admin@supremedetailing.co.nz"
             if org[0]:
                 org_email = (c.call("res.users", "read", [org[0]], fields=["email"])[0].get("email")) or org_email
-            att_vals = {}
-            if bemail:
-                ics = build_ics(eid, summary, new_start_utc, new_stop_utc, loc, sequence_now(),
-                                org_email, org[1] or "Supreme Detailing", bemail, booker[1] or "there")
-                aid = c.call("ir.attachment", "create", [{
-                    "name": "invite.ics", "type": "binary", "mimetype": "text/calendar",
-                    "datas": base64.b64encode(ics.encode("utf-8")).decode("ascii")}])
-                aid = aid[0] if isinstance(aid, list) else aid
-                att_vals = {"attachment_ids": [(6, 0, [aid])]}
-            c.call("mail.template", "send_mail", [RESCHEDULE_TEMPLATE_ID], eid,
-                   force_send=False, email_values=att_vals)
-            print(f"  [email] queued reschedule email{' + updated .ics invite' if att_vals else ' (no booker email -> no .ics)'}")
+            att = c.call("calendar.attendee", "search", [["event_id", "=", eid], ["partner_id", "=", bpid]]) if bpid else []
+            if not att:
+                print("  [email] booker has no attendee on this event — skipped")
+            else:
+                ev_vals = {}
+                if bemail:
+                    ics = build_ics(eid, f"Supreme Detailing — {svc}", new_start_utc, new_stop_utc, loc,
+                                    sequence_now(), org_email, org[1] or "Supreme Detailing", bemail, bname)
+                    aid = c.call("ir.attachment", "create", [{
+                        "name": "invite.ics", "type": "binary", "mimetype": "text/calendar",
+                        "datas": base64.b64encode(ics.encode("utf-8")).decode("ascii")}])
+                    aid = aid[0] if isinstance(aid, list) else aid
+                    ev_vals = {"attachment_ids": [(6, 0, [aid])]}
+                c.call("mail.template", "send_mail", [RESCHEDULE_TEMPLATE_ID], att[0],
+                       force_send=False, email_values=ev_vals)
+                print(f"  [email] queued reschedule email to booker{' + .ics' if ev_vals else ''}")
         except Exception as e:
             print(f"  [email] WARN could not queue reschedule email: {repr(e)[:180]}")
+
+        # (b) Chat card to the relevant detailer's space (Alex=North / Kade=Central)
+        try:
+            from chat_poster import post_payload
+            wurl = os.environ.get(CHAT_WEBHOOK_ENV.get(rid, ""))
+            if not wurl:
+                print(f"  [chat] {CHAT_WEBHOOK_ENV.get(rid)} not set — skipped")
+            else:
+                det = RA.RESOURCE_NAME.get(rid, "")
+                widgets = [{"decoratedText": {"topLabel": "Customer", "text": bname}},
+                           {"decoratedText": {"topLabel": "Service", "text": svc}}]
+                if loc:
+                    widgets.append({"decoratedText": {"topLabel": "Where", "text": loc}})
+                widgets.append({"decoratedText": {"topLabel": "Detailer", "text": det}})
+                payload = {"text": f"🔁 *Rescheduled* — {bname} · {when} · {svc}",
+                           "cardsV2": [{"cardId": f"resched-{eid}",
+                                        "card": {"header": {"title": "🔁 Booking rescheduled", "subtitle": when},
+                                                 "sections": [{"widgets": widgets}]}}]}
+                post_payload(payload, wurl)
+                print(f"  [chat] posted reschedule card to {CHAT_WEBHOOK_ENV[rid]}")
+        except Exception as e:
+            print(f"  [chat] WARN: {repr(e)[:160]}")
 
     print(f"\nDONE{' (dry-run — pass --commit)' if dry else ' (committed)'}")
 
