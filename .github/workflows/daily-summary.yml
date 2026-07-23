@@ -8,7 +8,12 @@ on:
     # 5:00 AM UTC = 6:00 PM NZDT (UTC+13)
     # Run at both to cover DST transitions — the NZ gate picks the right one.
     - cron: "0 5,6 * * *"
-  workflow_dispatch: {}   # manual "Run workflow" button
+  workflow_dispatch:      # manual "Run workflow" button — bypasses the 6pm gate
+    inputs:
+      date:
+        description: "Target date YYYY-MM-DD (blank = tomorrow NZ)"
+        required: false
+        default: ""
 
 concurrency:
   group: daily-summary
@@ -22,9 +27,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Gate to 6pm NZST/NZDT (hour 18 in Pacific/Auckland)
+      - name: Gate to 6pm NZST/NZDT (scheduled runs only; manual dispatch bypasses)
         id: gate
         run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual dispatch — bypassing 6pm gate"; echo "run=yes" >> "$GITHUB_OUTPUT"; exit 0
+          fi
           H=$(TZ='Pacific/Auckland' date +%H)
           echo "NZ hour = $H"
           if [ "$H" -ne 18 ]; then
@@ -43,4 +51,10 @@ jobs:
           GCHAT_CENTRAL_WEBHOOK: ${{ secrets.GCHAT_CENTRAL_WEBHOOK }}
           SD_ACTION_URL: ${{ secrets.SD_ACTION_URL }}
           SD_ACTION_SECRET: ${{ secrets.SD_ACTION_SECRET }}
-        run: python daily_summary.py
+          TARGET_DATE: ${{ github.event.inputs.date }}
+        run: |
+          if [ -n "$TARGET_DATE" ]; then
+            python daily_summary.py --date "$TARGET_DATE"
+          else
+            python daily_summary.py
+          fi
