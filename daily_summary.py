@@ -242,9 +242,10 @@ def main():
 
     c = OdooClient()
     print(f"    Connected to {c.url} as uid={c.uid}")
-    # "Open schedule" button target = the native Resource Bookings gantt (gantt-first,
-    # Alex/Kade lanes = availability). Opens straight to the gantt on tap.
-    SCHEDULE_URL = f"{c.url}/odoo/action-650"
+    # "Open schedule" button target = the PUBLIC schedule page (no Odoo backend login).
+    # (Was /odoo/action-650 — the backend gantt, which hit a login wall / went nowhere
+    # from a Chat tap. The public /schedule QWeb page is now live.)
+    SCHEDULE_URL = f"{c.url}/schedule"
 
     # Lookups for rich-card gathering (shared with enrich_calendar_events)
     answer_labels = E.fetch_answer_labels(c)
