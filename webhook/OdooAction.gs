@@ -36,7 +36,7 @@ function doGet(e) {
     if (p.action === 'cbooking') return customerBooking_(p);       // JSONP: booking + availability
     if (p.action === 'creschedule') return customerReschedule_(p); // confirm the customer's new time
     // Swap + reschedule accept a static key (the staff-only /schedule page can't HMAC-sign); else verify the sig.
-    if (!((p.action === 'swap' || p.action === 'reschedule') && CFG.SWAP_KEY && p.key === CFG.SWAP_KEY)) verify_(p);
+    if (!((p.action === 'swap' || p.action === 'reschedule' || p.action === 'sharetoggle') && CFG.SWAP_KEY && p.key === CFG.SWAP_KEY)) verify_(p);
     if (p.action === 'menu') return htmlMenu_(p.event);   // Change-stage menu
     if (p.action === 'paid') return htmlPayMenu_(p.event); // Mark-paid -> choose method
     if (p.action === 'reschedule') {   // /schedule gantt drag -> move the booking's time (+ optional lane)
@@ -46,6 +46,15 @@ function doGet(e) {
       dispatchReschedule_(p.event, rstart, rdet);
       return page_('Rescheduling to <b>' + rstart + '</b>' + (rdet ? ' with <b>' + rdet + '</b>' : '') +
                    ' — the calendar updates in a few seconds.', true);
+    }
+    if (p.action === 'sharetoggle') {   // /schedule per-day "Share detailers" switch
+      var sday = (p.day || '').trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(sday)) return page_('Bad day for the share toggle.', false);
+      var son = (p.on === '1' || p.on === 'true');
+      var sdays = shareDaysWrite_(login_(), sday, son);
+      return page_((son ? 'Detailers are now <b>SHARED</b> on <b>' + sday + '</b> — the other detailer shows on the shop as a drop-off.'
+                        : 'Back to <b>area-locked</b> on <b>' + sday + '</b>.') +
+                   '<br/>Shared days: ' + (sdays.length ? sdays.join(', ') : 'none'), true);
     }
     var uid = login_();
     if (p.action === 'swap') {   // flip Alex<->Kade -> dispatch the proven reassign_detailer.py
@@ -248,6 +257,27 @@ function doPost(e) {
   } catch (err) {
     return _jsonOut({ ok: false, error: String((err && err.message) || err) });
   }
+}
+
+// Per-day "Share detailers" set — ir.config_parameter `sd.share_days`, comma-separated ISO dates
+// (empty = global OFF = every day area-locked). Returns the resulting sorted list.
+// NB: ir.config_parameter.set_param is BROKEN by the SaaS monkeypatch (set_str arity) — write the
+// RECORD directly instead.
+function shareDaysWrite_(uid, day, on) {
+  var rows = execKw_(uid, 'ir.config_parameter', 'search_read',
+    [[['key', '=', 'sd.share_days']]], { fields: ['id', 'value'] });
+  var id, val = '';
+  if (rows && rows.length) { id = rows[0].id; val = rows[0].value || ''; }
+  else {
+    id = execKw_(uid, 'ir.config_parameter', 'create', [{ key: 'sd.share_days', value: '' }]);
+    if (Array.isArray(id)) id = id[0];
+  }
+  var days = String(val).split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s; });
+  var i = days.indexOf(day);
+  if (on) { if (i === -1) days.push(day); } else { if (i > -1) days.splice(i, 1); }
+  days.sort();
+  execKw_(uid, 'ir.config_parameter', 'write', [[id], { value: days.join(',') }]);
+  return days;
 }
 
 function getConfig_(uid, keys) {
