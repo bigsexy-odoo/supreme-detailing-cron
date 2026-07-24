@@ -127,6 +127,17 @@ def main():
     W("calendar.event", eid, {"start": new_start_utc, "stop": new_stop_utc}, context=TRACK_CTX)
     print(f"  [1] calendar.event.start/stop -> {new_start_utc} / {new_stop_utc}{' (would)' if dry else ''}")
 
+    # 1b) refresh the human date/time line in the event DESCRIPTION. mail.template 37/29 render
+    # object.description into the booking + reschedule emails; the 15-min sync only refreshes the
+    # PAID/AWAITING status (not the time), so without this the reschedule email shows the OLD time.
+    nz_date, nz_time = args.start.strip()[:10], args.start.strip()[11:16]
+    cur_desc = (c.call("calendar.event", "read", [eid], fields=["description"])[0].get("description") or "")
+    new_desc = re.sub(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}( \([\d.]+h\) NZ)",
+                      lambda mm: f"{nz_date} {nz_time}{mm.group(1)}", cur_desc, count=1)
+    if new_desc != cur_desc:
+        W("calendar.event", eid, {"description": new_desc}, context=NOISE_OFF)
+        print(f"  [1b] description date/time -> {nz_date} {nz_time}{' (would)' if dry else ''}")
+
     # 2) resolve the owning order line(s) via the SDCAL token, rewrite SDBK1 date+time (+resource if lane changed)
     _, line_ids = RA.resolve_targets(c, f"e{eid}")
     new_date = args.start[:10]

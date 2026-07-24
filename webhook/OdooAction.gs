@@ -31,6 +31,10 @@ var PAY_LABEL = { bank: 'Bank transfer', cash: 'Cash' };
 function doGet(e) {
   try {
     var p = e.parameter || {};
+    // Customer self-service reschedule (public /reschedule page) — gated by the booking's OWN
+    // attendee access_token (per-booking secret, in the customer's email), NOT the staff key.
+    if (p.action === 'cbooking') return customerBooking_(p);       // JSONP: booking + availability
+    if (p.action === 'creschedule') return customerReschedule_(p); // confirm the customer's new time
     // Swap + reschedule accept a static key (the staff-only /schedule page can't HMAC-sign); else verify the sig.
     if (!((p.action === 'swap' || p.action === 'reschedule') && CFG.SWAP_KEY && p.key === CFG.SWAP_KEY)) verify_(p);
     if (p.action === 'menu') return htmlMenu_(p.event);   // Change-stage menu
@@ -297,4 +301,101 @@ function fmtNZ_(utc) {
 
 function _jsonOut(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===== Customer self-service reschedule (public /reschedule page) =====================
+// Gated by the booking's attendee access_token (the per-booking secret in the customer email).
+// cbooking -> JSONP {booking summary + that detailer's working hours + their future bookings}
+// creschedule -> validate token, then fire the SAME dispatchReschedule_ pipeline as the staff drag.
+function _jsonp(cb, obj) {
+  return ContentService.createTextOutput((cb || 'callback') + '(' + JSON.stringify(obj) + ')')
+    .setMimeType(ContentService.MimeType.JAVASCRIPT);
+}
+
+// the attendee record whose access_token matches, on this event (false if none = bad link)
+function validAtt_(uid, eid, token) {
+  if (!eid || !token) return false;
+  var a = execKw_(uid, 'calendar.attendee', 'search',
+    [[['event_id', '=', eid], ['access_token', '=', token]]]);
+  return (a && a.length) ? a[0] : false;
+}
+
+// UTC 'YYYY-MM-DD HH:MM:SS' -> {day:'YYYY-MM-DD', min:<minutes past midnight>} in NZ local
+function toNZ_(utc) {
+  var m = /(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/.exec(utc || '');
+  if (!m) return null;
+  var d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]));
+  var day = Utilities.formatDate(d, 'Pacific/Auckland', 'yyyy-MM-dd');
+  var hm = Utilities.formatDate(d, 'Pacific/Auckland', 'HH:mm').split(':');
+  return { day: day, min: (+hm[0]) * 60 + (+hm[1]) };
+}
+
+// a resource's working window per weekday (0=Mon..6=Sun) from its resource calendar
+function resHours_(uid, resId) {
+  var byd = {};
+  var r = execKw_(uid, 'appointment.resource', 'read', [[resId], ['resource_calendar_id']]);
+  if (r && r[0] && r[0].resource_calendar_id) {
+    var att = execKw_(uid, 'resource.calendar.attendance', 'search_read',
+      [[['calendar_id', '=', r[0].resource_calendar_id[0]]]], { fields: ['dayofweek', 'hour_from', 'hour_to'] });
+    (att || []).forEach(function (a) {
+      var d = String(parseInt(a.dayofweek, 10));
+      var f = Math.round(a.hour_from * 60), t = Math.round(a.hour_to * 60);
+      byd[d] = byd[d] ? [Math.min(byd[d][0], f), Math.max(byd[d][1], t)] : [f, t];
+    });
+  }
+  return byd;
+}
+
+function customerBooking_(p) {
+  var cb = p.callback || 'callback';
+  try {
+    var uid = login_();
+    var eid = parseInt(p.e, 10), token = p.t;
+    if (!validAtt_(uid, eid, token)) return _jsonp(cb, { ok: false, error: 'invalid link' });
+    var ev = execKw_(uid, 'calendar.event', 'read', [[eid],
+      ['appointment_resource_ids', 'appointment_booker_id', 'appointment_type_id',
+       'start', 'stop', 'duration', 'location', 'appointment_status']]);
+    if (!ev || !ev[0]) return _jsonp(cb, { ok: false, error: 'not found' });
+    ev = ev[0];
+    if (ev.appointment_status === 'cancelled') return _jsonp(cb, { ok: false, error: 'cancelled' });
+    var resId = (ev.appointment_resource_ids && ev.appointment_resource_ids[0]) || 0;
+    var durMin = Math.round((ev.duration || 0) * 60);
+    var cur = toNZ_(ev.start);
+    // that resource's future booked jobs (for greying overlaps); include this event so the client can exclude it
+    var todayUtc = Utilities.formatDate(new Date(), 'UTC', 'yyyy-MM-dd') + ' 00:00:00';
+    var others = execKw_(uid, 'calendar.event', 'search_read',
+      [[['appointment_resource_ids', 'in', [resId]], ['appointment_status', '=', 'booked'], ['stop', '>', todayUtc]]],
+      { fields: ['id', 'start', 'duration'] });
+    var taken = (others || []).map(function (o) {
+      var n = toNZ_(o.start); return { event: o.id, day: n ? n.day : '', startMin: n ? n.min : 0, dur: Math.round((o.duration || 0) * 60) };
+    });
+    var at = execKw_(uid, 'appointment.type', 'read',
+      [[(ev.appointment_type_id && ev.appointment_type_id[0]) || 0], ['min_schedule_hours', 'min_cancellation_hours']]);
+    var lead = (at && at[0]) ? (at[0].min_schedule_hours || 0) : 0;
+    return _jsonp(cb, {
+      ok: true, event: eid,
+      cust: (ev.appointment_booker_id && ev.appointment_booker_id[1]) || '',
+      service: (ev.appointment_type_id && ev.appointment_type_id[1]) || 'Booking',
+      suburb: ev.location || '', resId: String(resId), resName: RES_NAME[resId] || '',
+      durMin: durMin, curDay: cur ? cur.day : '', curStartMin: cur ? cur.min : 0,
+      hours: resHours_(uid, resId), taken: taken, leadHours: lead
+    });
+  } catch (err) {
+    return _jsonp(cb, { ok: false, error: String((err && err.message) || err) });
+  }
+}
+
+function customerReschedule_(p) {
+  try {
+    var uid = login_();
+    var eid = parseInt(p.e, 10), token = p.t;
+    if (!validAtt_(uid, eid, token)) return page_('This reschedule link is invalid or has expired.', false);
+    var start = (p.start || '').replace('T', ' ');
+    if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(start)) return page_('That time looks wrong — please try again.', false);
+    dispatchReschedule_(String(eid), start, '');   // no detailer change for customers
+    return page_('Your booking is being moved to <b>' + start + '</b>. ' +
+                 'We&#39;ll email you the updated confirmation shortly.', true);
+  } catch (err) {
+    return page_('Sorry, something went wrong: ' + ((err && err.message) || err), false);
+  }
 }
