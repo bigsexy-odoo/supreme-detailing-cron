@@ -230,7 +230,11 @@ REGION_SUBURBS = {
                     "Milford", "Murrays Bay", "Takapuna"},
     "Central Auckland": {"Epsom", "Mount Eden", "Mount Roskill", "Onehunga", "Royal Oak"},
 }
-REGION_BASE = {"North Shore": "Milford", "Central Auckland": "Mount Eden"}
+# The drop-off address is the detailer's OWN address (res.partner.street/city/zip on the
+# resource's contact) — NOT hardcoded — so the boys can edit it in Odoo. Resource->partner:
+# 1=Alex->69, 2=Kade->70 (mirror reassign_detailer.RESOURCE_PARTNER).
+RESOURCE_PARTNER = {1: 69, 2: 70}
+_dropaddr_cache = {}
 
 
 def _region_of_suburb(suburb):
@@ -250,13 +254,47 @@ def _region_of_resource(resource_name):
     return None
 
 
-def dropoff_base(sdbk, resource_name=None):
-    """Base the customer brings the car to, or None for a normal mobile job."""
+RESOURCE_BY_REGION = {"North Shore": 1, "Central Auckland": 2}
+
+
+def prime_dropoff_addresses(client):
+    """Read each detailer contact's address ONCE per run into the cache as {'addr','city'}.
+    Called at sync start. A detailer with no street on file stays {} -> their cross-region
+    jobs are treated as NORMAL (never labelled drop-off without a real address)."""
+    for rid, pid in RESOURCE_PARTNER.items():
+        info = {}
+        p = client.call("res.partner", "read", [pid], fields=["street", "street2", "city", "zip"])
+        if p and p[0].get("street"):
+            p = p[0]
+            line1 = ", ".join(x for x in [p.get("street"), p.get("street2")] if x)
+            line2 = " ".join(x for x in [p.get("city"), p.get("zip")] if x)
+            info = {"addr": ", ".join(x for x in [line1, line2] if x),
+                    "city": (p.get("city") or "").strip()}
+        _dropaddr_cache[rid] = info
+
+
+def _dropoff_info(sdbk, resource_name):
+    """{'addr','city'} of the detailer's base if this is a cross-region drop-off with an
+    address on file, else None (= normal mobile job)."""
     sr = _region_of_suburb(sdbk.get("suburb"))
     rr = _region_of_resource(resource_name or sdbk.get("resource_name"))
-    if sr and rr and sr != rr:
-        return REGION_BASE.get(rr, rr)
-    return None
+    if not (sr and rr and sr != rr):
+        return None
+    info = _dropaddr_cache.get(RESOURCE_BY_REGION.get(rr))
+    return info if (info and info.get("addr")) else None
+
+
+def dropoff_base(sdbk, resource_name=None):
+    """Full drop-off ADDRESS (e.g. '21B Craig Rd, Milford 0620') for location/directions/
+    description, or None for a normal mobile job."""
+    info = _dropoff_info(sdbk, resource_name)
+    return info["addr"] if info else None
+
+
+def dropoff_label(sdbk, resource_name=None):
+    """Short base label (city, e.g. 'Milford') for the calendar TILE, or None."""
+    info = _dropoff_info(sdbk, resource_name)
+    return (info.get("city") or info["addr"]) if info else None
 
 
 def tile_title(sdbk, order, resource_name):
@@ -266,8 +304,8 @@ def tile_title(sdbk, order, resource_name):
     colour. 💰 = paid (gold, reads on any tile); blank = unpaid. EP/IP/SD/PO/RS = type."""
     paid = "💰 " if is_paid(order) else ""
     ini = (resource_name[:1] or "").upper()   # A (Alex) / K (Kade)
-    _db = dropoff_base(sdbk, resource_name)
-    where = f"{_db} DROP-OFF" if _db else sdbk["suburb"]
+    _dl = dropoff_label(sdbk, resource_name)   # short city for the tile; full address lives in location/description
+    where = f"{_dl} DROP-OFF" if _dl else sdbk["suburb"]
     return f"{paid}{ini} {type_code(sdbk['service_label'])} {where}"
 
 
@@ -656,7 +694,7 @@ def build_description(sdbk, resource_name, line_id, order):
         paid,
         f"\U0001f697 Service: {sdbk['service_label']}",
         (f"\U0001f4cd DROP-OFF at {dropoff_base(sdbk, resource_name)} — customer brings the car "
-         f"(they are in {sdbk['suburb']}) — DO NOT drive out"
+         f"here (they are in {sdbk['suburb']}) — DO NOT drive out"
          if dropoff_base(sdbk, resource_name) else f"\U0001f4cd Suburb: {sdbk['suburb']}"),
         f"\U0001f464 Detailer: {resource_name}",
         f"\U0001f550 {sdbk['date']} {sdbk['time24']} ({sdbk['duration']}h) NZ",
@@ -1352,6 +1390,10 @@ def _run(mode):
     log(f"    connected uid={C.uid} db={C.db}  confirmed-states={CONFIRMED_STATES} "
         f"(sent needs a payment tx)  email={'OFF' if ARGS.no_email else 'ON'}  "
         f"sms={'ON' if ARGS.with_sms else 'OFF'}")
+
+    prime_dropoff_addresses(C)   # detailer base addresses for Share-detailers DROP-OFF jobs
+    _drops = {f"res{k}": v.get("addr") for k, v in _dropaddr_cache.items() if v.get("addr")}
+    log(f"    drop-off bases: {_drops or 'none set (cross-region jobs treated as normal)'}")
 
     _RESOURCES = {r["id"]: r["name"] for r in
                   C.call("appointment.resource", "search_read", [], fields=["id", "name"])}
