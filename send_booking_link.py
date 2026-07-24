@@ -40,7 +40,7 @@ def main():
         email = ""
         if booker[0]:
             email = (c.call("res.partner", "read", [booker[0]], fields=["email"])[0].get("email")) or ""
-        link = f"{BASE}/calendar/meeting/view?token={(atts[0]['access_token'] if atts else '')}&id={eid}"
+        link = f"{BASE}/reschedule?t={(atts[0]['access_token'] if atts else '')}&e={eid}"
         print(f"\nevent {eid} '{ev['name']}'  start={ev['start']}")
         print(f"  customer : {booker[1]} <{email or 'NO EMAIL'}>")
         print(f"  reschedule link: {link}")
