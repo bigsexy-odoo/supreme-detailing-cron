@@ -219,6 +219,46 @@ def type_code(service_label):
     return (service_label[:2] or "??").upper()
 
 
+# --- DROP-OFF detection ---------------------------------------------------------------
+# When the boys toggle "Share detailers" for a day, a customer can book the OTHER region's
+# detailer. That is a DROP-OFF: the customer brings the car to that detailer's base, so the
+# job is NOT at their suburb. Detect it by comparing the booked detailer's region with the
+# suburb's region and say so on every staff-facing surface (title / location / description /
+# directions) — otherwise a detailer drives out to a customer who is coming to them.
+REGION_SUBURBS = {
+    "North Shore": {"Campbells Bay", "Castor Bay", "Forest Hill", "Mairangi Bay",
+                    "Milford", "Murrays Bay", "Takapuna"},
+    "Central Auckland": {"Epsom", "Mount Eden", "Mount Roskill", "Onehunga", "Royal Oak"},
+}
+REGION_BASE = {"North Shore": "Milford", "Central Auckland": "Mount Eden"}
+
+
+def _region_of_suburb(suburb):
+    s = (suburb or "").strip()
+    for region, subs in REGION_SUBURBS.items():
+        if s in subs:
+            return region
+    return None
+
+
+def _region_of_resource(resource_name):
+    r = resource_name or ""
+    if "North" in r:
+        return "North Shore"
+    if "Central" in r:
+        return "Central Auckland"
+    return None
+
+
+def dropoff_base(sdbk, resource_name=None):
+    """Base the customer brings the car to, or None for a normal mobile job."""
+    sr = _region_of_suburb(sdbk.get("suburb"))
+    rr = _region_of_resource(resource_name or sdbk.get("resource_name"))
+    if sr and rr and sr != rr:
+        return REGION_BASE.get(rr, rr)
+    return None
+
+
 def tile_title(sdbk, order, resource_name):
     """[💰 if paid] [A/K detailer] CODE Suburb  e.g. '💰 K SD Onehunga' or 'A EP Milford'.
     The Meetings calendar can't colour by detailer on a single login (Odoo colours every
@@ -226,7 +266,9 @@ def tile_title(sdbk, order, resource_name):
     colour. 💰 = paid (gold, reads on any tile); blank = unpaid. EP/IP/SD/PO/RS = type."""
     paid = "💰 " if is_paid(order) else ""
     ini = (resource_name[:1] or "").upper()   # A (Alex) / K (Kade)
-    return f"{paid}{ini} {type_code(sdbk['service_label'])} {sdbk['suburb']}"
+    _db = dropoff_base(sdbk, resource_name)
+    where = f"{_db} DROP-OFF" if _db else sdbk["suburb"]
+    return f"{paid}{ini} {type_code(sdbk['service_label'])} {where}"
 
 
 def detailer_partner_for(resource_id):
@@ -597,7 +639,10 @@ def build_description(sdbk, resource_name, line_id, order):
         if p.get("phone"):
             tel = re.sub(r"[^\d+]", "", p["phone"])
             actions.append(f'\U0001f4de <a href="tel:{tel}">Call</a>')
-        addr = ", ".join(x for x in [
+        # a DROP-OFF job happens at the detailer's base -> never point Directions at the
+        # customer's house (that is exactly how someone ends up driving out by mistake)
+        _dbase_dir = dropoff_base(sdbk, resource_name)
+        addr = _dbase_dir or ", ".join(x for x in [
             ", ".join(y for y in [p.get("street"), p.get("street2")] if y),
             " ".join(y for y in [p.get("city"), p.get("zip")] if y),
         ] if x) or sdbk.get("suburb")
@@ -610,7 +655,9 @@ def build_description(sdbk, resource_name, line_id, order):
     lines = [
         paid,
         f"\U0001f697 Service: {sdbk['service_label']}",
-        f"\U0001f4cd Suburb: {sdbk['suburb']}",
+        (f"\U0001f4cd DROP-OFF at {dropoff_base(sdbk, resource_name)} — customer brings the car "
+         f"(they are in {sdbk['suburb']}) — DO NOT drive out"
+         if dropoff_base(sdbk, resource_name) else f"\U0001f4cd Suburb: {sdbk['suburb']}"),
         f"\U0001f464 Detailer: {resource_name}",
         f"\U0001f550 {sdbk['date']} {sdbk['time24']} ({sdbk['duration']}h) NZ",
         f"\U0001f9fe Order {order.get('name')}{amt_str}",
@@ -1073,7 +1120,9 @@ def process(rec, writer):
     # Tile-friendly title: paid marker + customer + short service + suburb (time shows
     # automatically on the calendar tile; detailer shows via colour/description).
     ename = tile_title(sdbk, order, resource_name)
-    location = f"{sdbk['suburb']}, Auckland" if sdbk["suburb"] else "Auckland"
+    _dbase = dropoff_base(sdbk, resource_name)
+    location = (f"{_dbase} (DROP-OFF), Auckland" if _dbase
+                else (f"{sdbk['suburb']}, Auckland" if sdbk["suburb"] else "Auckland"))
 
     # --- Email eligibility (present address + future + not --no-email) ---
     booker_email = None
