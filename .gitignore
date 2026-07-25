@@ -19,3 +19,5 @@ logs/
 # Session diagnostic probes
 _reaper_*.py
 _reaper_*.txt
+
+gbp_client_secret.json

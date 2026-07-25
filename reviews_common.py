@@ -205,10 +205,11 @@ _RIDE_RE = re.compile(r'(s_quotes_carousel carousel[^>]*?data-bs-ride=")[^"]*(")
 _CID_RE = re.compile(r'id="(myQuoteCarousel\d+)"')
 
 
-def update_carousel_arch(arch: str, reviews: list, interval: int = 10000) -> str:
+def update_carousel_arch(arch: str, reviews: list, interval: int = 10000, max_items: int = 6) -> str:
     """Refresh the #reviews carousel slides + dots between markers, set the cycle
     interval, and ensure it AUTOPLAYS (data-bs-ride='carousel' — 'true' only cycles
-    after a manual swipe). Requires the one-time install to have added the markers."""
+    after a manual swipe). Requires the one-time install to have added the markers.
+    max_items = how many reviews to play back (Places feed passes 6; the GBP feed passes more)."""
     m = _CID_RE.search(arch)
     if not m:
         raise RuntimeError("carousel id not found")
@@ -217,24 +218,25 @@ def update_carousel_arch(arch: str, reviews: list, interval: int = 10000) -> str
         raise RuntimeError("GR carousel markers not found — run _push_reviews_carousel.py first")
     new = _INTERVAL_RE.sub(lambda mm: mm.group(1) + str(interval) + mm.group(2), arch, count=1)
     new = _RIDE_RE.sub(lambda mm: mm.group(1) + "carousel" + mm.group(2), new, count=1)
-    new = _SLIDES_RE.sub(lambda _mm: carousel_slides(reviews), new, count=1)
-    new = _DOTS_RE.sub(lambda _mm: carousel_dots(reviews, cid), new, count=1)
+    new = _SLIDES_RE.sub(lambda _mm: carousel_slides(reviews, max_items=max_items), new, count=1)
+    new = _DOTS_RE.sub(lambda _mm: carousel_dots(reviews, cid, max_items=max_items), new, count=1)
     return clean_over_escaping(new)
 
 
-def update_ribbon_arch(arch: str, reviews: list, interval_ms: int = 5000) -> str:
+def update_ribbon_arch(arch: str, reviews: list, interval_ms: int = 5000, max_items: int = 5) -> str:
     """Swap the ribbon's visible spans + JS array with fresh reviews, and set the
-    rotator cycle to interval_ms. Guarded."""
+    rotator cycle to interval_ms. Guarded. max_items = playback count (Places passes 5;
+    the GBP feed passes more so the ribbon rotates through the full pool, not just 5)."""
     new = arch
     n_bar = len(_BAR_RE.findall(new))
     if n_bar != 1:
         raise RuntimeError(f"expected 1 .sd-testimonial-bar div, found {n_bar}")
-    new = _BAR_RE.sub(lambda m: m.group(1) + ribbon_spans(reviews) + m.group(3), new, count=1)
+    new = _BAR_RE.sub(lambda m: m.group(1) + ribbon_spans(reviews, max_items=max_items) + m.group(3), new, count=1)
 
     n_js = len(_JS_RE.findall(new))
     if n_js != 1:
         raise RuntimeError(f"expected 1 'var quotes = [...]' array, found {n_js}")
-    new = _JS_RE.sub(lambda m: ribbon_js_array(reviews), new, count=1)
+    new = _JS_RE.sub(lambda m: ribbon_js_array(reviews, max_items=max_items), new, count=1)
 
     n_rot = len(_ROT_RE.findall(new))
     if n_rot != 1:
