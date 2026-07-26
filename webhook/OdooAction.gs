@@ -65,10 +65,17 @@ function doGet(e) {
       dispatchReassign_(p.event, toName);
       return page_('Swapping this booking to <b>' + toName + '</b> — the calendar updates in a few seconds.', true);
     }
-    if (p.action === 'delete') {   // /schedule card "Delete" -> archive event + free the slot hold (instant)
+    if (p.action === 'delete') {   // /schedule card "Delete" -> cancel + archive + free the slot hold
       var delId = parseInt(p.event, 10);
       if (!delId) return page_('Bad booking id.', false);
-      execKw_(uid, 'calendar.event', 'write', [[delId], { active: false }]);   // archive -> off the calendar
+      // Clear the attendees + blank the description BEFORE archiving (all in one suppressed write),
+      // so Odoo does NOT fire a native Google "Cancelled event" .ics to the organiser/attendees.
+      // That native cancel is off-brand (Google chrome) and renders the stale booking body + a
+      // pointless "reschedule" link. Removing the attendees leaves nobody to notify; blanking the
+      // description means even a stray notification carries no stale content.
+      var NOMAIL = { context: { no_mail_to_attendees: true, mail_notify_author: false, tracking_disable: true, mail_create_nolog: true } };
+      execKw_(uid, 'calendar.event', 'write',
+              [[delId], { partner_ids: [[5, 0, 0]], description: '', active: false, appointment_status: 'cancelled' }], NOMAIL);
       var delHolds = execKw_(uid, 'appointment.booking.line', 'search',
                              [[['calendar_event_id', '=', delId]]], { context: { active_test: false } });
       if (delHolds && delHolds.length) execKw_(uid, 'appointment.booking.line', 'unlink', [delHolds]);
