@@ -1510,8 +1510,10 @@ def process(rec, writer):
             html = build_customer_email_html(sdbk, resource_name, order, addr_full,
                                              partner_name, booker_mobile, etok, event_id,
                                              start_utc, stop_utc, location)
-            frm = ((C.call("res.users", "read", [ORGANIZER_USER], fields=["email_formatted"]) or [{}])[0]
-                   .get("email_formatted")) or "Supreme Detailing <bookings@supremedetailing.co.nz>"
+            # Sender = fixed bookings@ (intended Google-Workspace send-as/alias on the SMTP user
+            # admin@). Until that alias is live, Gmail rewrites the From to admin@ (still delivered
+            # to Primary); once the alias exists it displays as bookings@ with no code change.
+            frm = "Supreme Detailing <bookings@supremedetailing.co.nz>"
             # Light "Add to calendar" card via an attached METHOD:PUBLISH .ics (no invite chrome).
             ics_att = build_ics_attachment(sdbk, resource_name, order, location, start_utc, stop_utc, event_id)
             mid = C.call("mail.mail", "create", [{
