@@ -368,12 +368,14 @@ function _jsonp(cb, obj) {
     .setMimeType(ContentService.MimeType.JAVASCRIPT);
 }
 
-// the attendee record whose access_token matches, on this event (false if none = bad link)
+// Validate the reschedule link against the EVENT's own access_token (the customer is no longer a
+// calendar attendee -- the sync stopped adding them so Odoo would not email a raw .ics invite --
+// so the per-booking secret in the branded email is calendar.event.access_token). Returns the
+// event id (truthy) on match, false on a bad/expired link.
 function validAtt_(uid, eid, token) {
   if (!eid || !token) return false;
-  var a = execKw_(uid, 'calendar.attendee', 'search',
-    [[['event_id', '=', eid], ['access_token', '=', token]]]);
-  return (a && a.length) ? a[0] : false;
+  var e = execKw_(uid, 'calendar.event', 'read', [[eid], ['access_token']]);
+  return (e && e[0] && e[0].access_token && e[0].access_token === token) ? eid : false;
 }
 
 // UTC 'YYYY-MM-DD HH:MM:SS' -> {day:'YYYY-MM-DD', min:<minutes past midnight>} in NZ local

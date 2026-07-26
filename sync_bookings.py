@@ -74,6 +74,7 @@ Creds: odoo_client.cfg() reads env vars first (GitHub secrets) then .env.
 """
 
 import argparse
+import base64
 import csv
 import io
 import json
@@ -873,6 +874,46 @@ def build_customer_email_html(sdbk, resource_name, order, addr_full, client_name
 </td></tr></table></body></html>"""
 
 
+def build_ics_attachment(sdbk, resource_name, order, location, start_utc, stop_utc, event_id):
+    """Create a METHOD:PUBLISH .ics ir.attachment for the booking and return its id (or None).
+
+    Attached to the branded email so Gmail renders a light 'Add to calendar' card. It is
+    deliberately METHOD:PUBLISH with NO ATTENDEE/ORGANIZER lines -- a METHOD:REQUEST invite (what
+    Odoo sends when the customer is an event attendee) is what carries Gmail's Organizer/Guests/
+    RSVP/View-map chrome. This gives the customer the calendar entry WITHOUT that chrome."""
+    def _dt(u):  # 'YYYY-MM-DD HH:MM:SS' (UTC) -> 'YYYYMMDDTHHMMSSZ'
+        return u.replace("-", "").replace(":", "").replace(" ", "T") + "Z"
+    def esc(s):  # RFC5545 text escaping
+        return (str(s).replace("\\", "\\\\").replace(";", "\\;")
+                .replace(",", "\\,").replace("\n", "\\n"))
+    dbase = dropoff_base(sdbk, resource_name)
+    loc = f"{dbase}, Auckland" if dbase else (location or "Auckland")
+    bank_plain = BANK_LINE.replace("&middot;", "-")  # .ics is plain text, not HTML
+    desc = (f"{sdbk['service_label']} with {resource_name}. Order {order.get('name')}. "
+            f"Pay by bank transfer: {bank_plain} - reference {order.get('name')}.")
+    ics = "\r\n".join([
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Supreme Detailing//Booking//EN",
+        "CALSCALE:GREGORIAN", "METHOD:PUBLISH", "BEGIN:VEVENT",
+        f"UID:sd-{event_id}@supremedetailing.co.nz",
+        f"DTSTAMP:{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}",
+        f"DTSTART:{_dt(start_utc)}", f"DTEND:{_dt(stop_utc)}",
+        f"SUMMARY:{esc('Supreme Detailing - ' + sdbk['service_label'])}",
+        f"LOCATION:{esc(loc)}", f"DESCRIPTION:{esc(desc)}",
+        "STATUS:CONFIRMED", "TRANSP:OPAQUE", "END:VEVENT", "END:VCALENDAR",
+    ]) + "\r\n"
+    try:
+        aid = C.call("ir.attachment", "create", [{
+            "name": "supreme-detailing-booking.ics",
+            "datas": base64.b64encode(ics.encode("utf-8")).decode("ascii"),
+            "mimetype": "text/calendar; method=PUBLISH; charset=UTF-8",
+            "res_model": "mail.mail", "res_id": 0,
+        }], context=NOISE_OFF)
+        return aid[0] if isinstance(aid, (list, tuple)) else aid
+    except Exception as e:  # noqa: BLE001
+        log(f"      WARNING: .ics attachment build failed: {e}")
+        return None
+
+
 def append_order_marker(order, line_id, event_id):
     """Append the audit token to sale.order.client_order_ref (idempotent)."""
     ref = order.get("client_order_ref") or ""
@@ -1161,28 +1202,35 @@ def confirm_and_invoice_order(order, recs, writer):
         writer.writerow([_now(), oname, "", "invoice", "", "|".join(acts)])
         return acts
 
-    # 2) INVOICE  create + post if the order has none yet.
+    # 2) INVOICE  create if the order has none, then POST any DRAFT out-invoice.
     invs = _order_out_invoices(order["id"])
-    inv_id = invs[0][0] if invs else None
-    if invs:
-        acts.append("inv-exists")
-    elif ARGS.dry_run:
-        acts.append("would-invoice")
-    else:
+    if not invs and not ARGS.dry_run:
         ctx = {"active_ids": [order["id"]], "active_model": "sale.order"}
         wid = C.call("sale.advance.payment.inv", "create",
                      [{"advance_payment_method": "delivered"}], context=ctx)
         wid = wid[0] if isinstance(wid, list) else wid
         C.call("sale.advance.payment.inv", "create_invoices", [wid], context=ctx)
+        invs = _order_out_invoices(order["id"])
+        acts.append("invoiced")
+    elif not invs and ARGS.dry_run:
+        acts.append("would-invoice")
+    elif invs:
+        acts.append("inv-exists")
+    # POST any DRAFT out-invoice, whether we just raised it OR it pre-existed (from the website
+    # checkout / a prior partial pass). The old code only posted invoices it created itself, so a
+    # pre-existing draft was left unposted forever -> the invoice email (#10, posted-only) never
+    # fired. Post it here so Awaiting-Payment invoices always email.
+    if not ARGS.dry_run:
         drafts = [i for i, st in _order_out_invoices(order["id"]) if st == "draft"]
         for d in drafts:
             C.call("account.move", "write", [d],
                    {"invoice_payment_term_id": DUE_ON_RECEIPT_TERM}, context=NOISE_OFF)
             C.call("account.move", "action_post", [d])
-        posted = [i for i, st in _order_out_invoices(order["id"]) if st == "posted"]
-        inv_id = posted[0] if posted else (drafts[0] if drafts else None)
-        acts.append(f"invoiced:{inv_id}")
-        log(f"    INV {oname}: posted invoice {inv_id} (Due on receipt / Awaiting Payment)")
+        if drafts:
+            acts.append(f"posted:{drafts}")
+            log(f"    INV {oname}: posted invoice(s) {drafts} (Due on receipt / Awaiting Payment)")
+    posted = [i for i, st in _order_out_invoices(order["id"]) if st == "posted"]
+    inv_id = posted[0] if posted else (invs[0][0] if invs else None)
 
     # 3) INVOICE EMAIL #10  (once; queued force_send=False -> cap-safe like #37).
     if inv_id and ARGS.dry_run and not ARGS.no_email:
@@ -1384,10 +1432,13 @@ def process(rec, writer):
         "duration": sdbk["duration"],
         "partner_id": ORGANIZER_PARTNER,
         "user_id": ORGANIZER_USER,
-        # Attendees = the customer AND the org partner, so the booking shows on the
-        # single Supreme Detailing calendar (Odoo Calendar filters to "my" attendees;
-        # detailer separation is via appointment_resource_ids + the description).
-        "partner_ids": [(6, 0, [booker_id])] if booker_id else [(6, 0, [])],
+        # The CUSTOMER is deliberately NOT a calendar attendee. Making the booker an attendee
+        # is what made Odoo email a raw .ics calendar INVITE (Gmail's Organizer/Guests/RSVP/
+        # View-map chrome -- unbrandable, and it fired even under no_mail_to_attendees). Instead
+        # the customer gets the branded HTML email + an attached METHOD:PUBLISH .ics (a light
+        # "Add to calendar" card, no chrome). Only the DETAILER is added as an attendee below
+        # (calendar colour + their own calendar); appointment_booker_id still records who booked.
+        "partner_ids": [(6, 0, [])],
         "appointment_booker_id": booker_id,
         "appointment_type_id": sdbk["appt_type_id"],
         # Assign the detailer via a booking line (carries capacity) -- NOT the m2m
@@ -1444,10 +1495,10 @@ def process(rec, writer):
         log("      WARNING: booker has no email -- booking email skipped")
     else:
         try:
-            att = C.call("calendar.attendee", "search_read",
-                         [["event_id", "=", event_id], ["partner_id", "=", booker_id]],
-                         fields=["id", "access_token"], limit=1)
-            atok = att[0].get("access_token") if att else ""
+            # Reschedule link now uses the EVENT's own access_token (the customer is no longer a
+            # calendar attendee, so there is no attendee token). The /reschedule Apps Script
+            # (validAtt_) validates against calendar.event.access_token to match.
+            etok = (C.call("calendar.event", "read", [event_id], fields=["access_token"]) or [{}])[0].get("access_token") or ""
             pa = C.call("res.partner", "read", [booker_id],
                         fields=["street", "street2", "city", "zip"])
             pa = pa[0] if pa else {}
@@ -1457,10 +1508,12 @@ def process(rec, writer):
             ] if x) or (f"{sdbk.get('suburb')}, Auckland" if sdbk.get("suburb") else "")
             subj = build_email_subject(sdbk, resource_name, partner_name)
             html = build_customer_email_html(sdbk, resource_name, order, addr_full,
-                                             partner_name, booker_mobile, atok, event_id,
+                                             partner_name, booker_mobile, etok, event_id,
                                              start_utc, stop_utc, location)
             frm = ((C.call("res.users", "read", [ORGANIZER_USER], fields=["email_formatted"]) or [{}])[0]
                    .get("email_formatted")) or "Supreme Detailing <bookings@supremedetailing.co.nz>"
+            # Light "Add to calendar" card via an attached METHOD:PUBLISH .ics (no invite chrome).
+            ics_att = build_ics_attachment(sdbk, resource_name, order, location, start_utc, stop_utc, event_id)
             mid = C.call("mail.mail", "create", [{
                 "subject": subj,
                 "body_html": html,
@@ -1468,6 +1521,7 @@ def process(rec, writer):
                 "email_from": frm,
                 "author_id": ORGANIZER_PARTNER,
                 "state": "outgoing",
+                "attachment_ids": [(6, 0, [ics_att])] if ics_att else [],
             }], context=NOISE_OFF)
             mid = mid[0] if isinstance(mid, (list, tuple)) else mid
             mailed = f"branded mail.mail{mid}"
