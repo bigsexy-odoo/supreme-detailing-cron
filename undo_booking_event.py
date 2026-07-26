@@ -127,17 +127,29 @@ def main():
     for e in ev:
         log(f"    event {e['id']}: {e['name']} @ {e['start']}")
 
+    # The RESOURCE HOLD is what actually blocks the slot. Odoo ARCHIVES (does not delete) an
+    # event that has attendees / was emailed / is synced, and archiving leaves its
+    # appointment.booking.line hold in place -> the slot STAYS BLOCKED. There's no UI screen
+    # for that model, so deleting the event in Calendar/Bookings can't free the slot. We must
+    # remove the holds explicitly.
+    holds = c.call("appointment.booking.line", "search",
+                   [["calendar_event_id", "in", event_ids]], context={"active_test": False})
+    log(f"    slot holds (appointment.booking.line) to free: {holds or 'none'}")
+
     if not args.commit:
-        log(f"    DRY-RUN — would unlink {len(event_ids)} event(s) and clear their markers")
+        log(f"    DRY-RUN — would free {len(holds)} slot hold(s) + unlink {len(event_ids)} event(s) and clear markers")
         if order:
             strip_ref_tokens(c, order, set(event_ids), commit=False)
         return
 
+    if holds:
+        c.call("appointment.booking.line", "unlink", holds, context=NOISE_OFF)
+        log(f"    freed {len(holds)} slot hold(s): {holds}")
     c.call("calendar.event", "unlink", event_ids, context=NOISE_OFF)
     log(f"    unlinked {len(event_ids)} event(s): {event_ids}")
     if order:
         strip_ref_tokens(c, order, set(event_ids), commit=True)
-    log("=== done ===")
+    log("=== done — slots freed ===")
 
 
 if __name__ == "__main__":
