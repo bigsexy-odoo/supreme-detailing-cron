@@ -609,12 +609,15 @@ def already_synced(order, line_id, booker_partner_id, start_utc, appt_type_id):
                 return int(num)
             vlog(f"L{line_id}: order-ref token points to deleted event {num} -> re-create")
 
-    # 2. BOUNDED marker search (full comment -> no L12/L123 collision)
+    # 2. BOUNDED marker search (full comment -> no L12/L123 collision). Include ARCHIVED:
+    #    an archived match = the booking was CANCELLED via the "Delete booking" action, so
+    #    return the sentinel "CANCELLED" and the caller must NOT re-create it.
     marker = MARKER_COMMENT.format(line_id=line_id)
-    hit = C.call("calendar.event", "search",
-                 [["description", "ilike", marker]], limit=1)
+    hit = C.call("calendar.event", "search_read",
+                 [["description", "ilike", marker]],
+                 fields=["id", "active"], context={"active_test": False}, limit=1)
     if hit:
-        return hit[0]
+        return hit[0]["id"] if hit[0]["active"] else "CANCELLED"
 
     # 3. natural-key fallback (booker + exact start + type). NOT line-scoped, so guard
     #    against collapsing a DIFFERENT line's event into this one (two vehicles on one
@@ -641,6 +644,30 @@ def slot_conflict(resource_id, start_utc, stop_utc):
            ["start", "<", stop_utc],
            ["stop", ">", start_utc]]
     return C.call("calendar.event", "search", dom)
+
+
+def reap_cancelled_holds():
+    """Free the slot for any booking cancelled via the no-code 'Delete booking' action.
+    That action ARCHIVES the calendar.event (active=False); Odoo leaves the
+    appointment.booking.line HOLD behind so the slot stays blocked, and there is no UI
+    screen for that model. So we free it here: delete every booking-line hold whose event
+    is archived. Active/real bookings (e.g. Will's) are untouched. Runs each sync pass."""
+    lines = C.call("appointment.booking.line", "search_read", [["id", ">", 0]],
+                   fields=["id", "calendar_event_id"], context={"active_test": False})
+    ev_ids = list({l["calendar_event_id"][0] for l in lines if l.get("calendar_event_id")})
+    if not ev_ids:
+        return
+    evs = C.call("calendar.event", "read", ev_ids, fields=["id", "active"],
+                 context={"active_test": False})
+    archived = {e["id"] for e in evs if not e["active"]}
+    dead = [l["id"] for l in lines if l.get("calendar_event_id") and l["calendar_event_id"][0] in archived]
+    if not dead:
+        return
+    if ARGS.dry_run:
+        log(f"[reap] would free {len(dead)} slot-hold(s) of cancelled/archived bookings: {dead}")
+        return
+    C.call("appointment.booking.line", "unlink", dead, context=NOISE_OFF)
+    log(f"[reap] freed {len(dead)} slot-hold(s) of cancelled/archived bookings: {dead}")
 
 
 def build_description(sdbk, resource_name, line_id, order):
@@ -1239,6 +1266,12 @@ def process(rec, writer):
 
     # --- Idempotency: already synced? ---
     existing = already_synced(order, lid, booker_id, start_utc, sdbk["appt_type_id"])
+    if existing == "CANCELLED":
+        # Booking was deleted via the no-code "Delete booking" action (event archived).
+        # Do NOT re-create it; the reaper frees its slot hold.
+        log(f"  {oname} L{lid}: booking cancelled (event archived) -- skip, not re-creating")
+        writer.writerow([_now(), oname, lid, "cancelled-skip", "", "archived via Delete booking action"])
+        return "cancelled-skip"
     if existing:
         # Self-heal the detailer colour: re-attach the detailer participant if anything
         # stripped it since last run (manual edit, or an emailless-attendee reap). Idempotent
@@ -1554,6 +1587,10 @@ def _run(mode):
     _APPT_TYPES = {t["id"] for t in
                    C.call("appointment.type", "search_read", [], fields=["id"])}
     log(f"    resources: {_RESOURCES}")
+
+    # Free the slots of any bookings cancelled via the no-code "Delete booking" action
+    # (archives the event; leaves the hold). Runs every pass, before (re)processing orders.
+    reap_cancelled_holds()
 
     # Detailer-contact email preflight: an emailless detailer contact gets reaped from the
     # attendee list ~80s after each event write, so the colour vanishes and every run churns
