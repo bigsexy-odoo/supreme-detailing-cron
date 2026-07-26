@@ -660,7 +660,7 @@ def build_description(sdbk, resource_name, line_id, order):
     # owner's "drop awaiting" note was about the calendar tile (title), not the email.
     paid = ("\U0001f4b0 PAID"
             if is_paid(order)
-            else "⏳ AWAITING PAYMENT (pay by bank transfer or cash on the day)")
+            else "⏳ AWAITING PAYMENT (pay by bank transfer)")
     amt = order.get("amount_total")
     amt_str = f" · ${amt:.2f} NZD" if amt else ""
 
@@ -707,6 +707,143 @@ def build_description(sdbk, resource_name, line_id, order):
         PST_MARKER.format(state=order.get("state")),
     ]
     return "<br/>\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# BRANDED customer booking email (replaces the Google-Calendar .ics invite).
+# The customer gets a clean HTML email (no calendar-invite chrome); the detailer
+# still gets the calendar event. Built here in the external sync = zero billable
+# Odoo LoC (Rule 9). Bank details: pay-by-transfer to the receiving account.
+# ---------------------------------------------------------------------------
+SD_ORANGE = "#E17726"
+SD_DARK   = "#141414"
+SD_SITE   = "https://www.supremedetailing.co.nz"
+SD_LOGO   = "https://supreme-detailing-assets.netlify.app/logo-email.png"
+SD_IG_IMG = "https://supreme-detailing-assets.netlify.app/instagram.png?v=2"
+SD_FB_IMG = "https://supreme-detailing-assets.netlify.app/facebook.png?v=2"
+SD_IG_URL = "https://www.instagram.com/supremedetailing.co.nz/"
+SD_FB_URL = "https://www.facebook.com/profile.php?id=61590860083780"
+BANK_LINE = "Alex MacLeod (Supreme Detailing) &middot; 03-0275-0076063-001"
+
+_WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_MO = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _wday_mon(iso):
+    """'2026-08-01' -> 'Sat 01 Aug'."""
+    try:
+        y, m, d = [int(x) for x in iso.split("-")]
+        return f"{_WD[datetime(y, m, d).weekday()]} {d:02d} {_MO[m - 1]}"
+    except Exception:
+        return iso
+
+
+def _detailer_first(resource_name):
+    """'Alex (North Shore)' -> 'Alex'."""
+    return re.split(r"[\s(]", (resource_name or "").strip(), 1)[0] if resource_name else ""
+
+
+def build_email_subject(sdbk, resource_name, client_name):
+    """Supreme Detailing · <package> · <client> · <suburb> · <detailer> · <ddd dd Mon HH:MM>"""
+    when = f"{_wday_mon(sdbk['date'])} {sdbk['time24']}"
+    parts = ["Supreme Detailing", sdbk.get("service_label"), client_name,
+             sdbk.get("suburb"), _detailer_first(resource_name), when]
+    return " · ".join(str(x) for x in parts if x)
+
+
+def _z(dt_utc):
+    """'2026-08-01 00:00:00' -> '20260801T000000Z' for a Google-Calendar link."""
+    return dt_utc.replace("-", "").replace(":", "").replace(" ", "T") + "Z"
+
+
+def _btn(label, href, bg=SD_ORANGE, fg="#ffffff"):
+    return (f'<a href="{href}" style="display:inline-block;padding:11px 18px;margin:6px 8px 0 0;'
+            f'background:{bg};color:{fg};text-decoration:none;border-radius:8px;'
+            f'font-family:Arial,Helvetica,sans-serif;font-size:14px;font-weight:bold;">{label}</a>')
+
+
+def _row(label, value):
+    return (f'<tr><td style="padding:6px 0;color:#8a8a8a;font-size:13px;width:120px;'
+            f'vertical-align:top;font-family:Arial,Helvetica,sans-serif;">{label}</td>'
+            f'<td style="padding:6px 0;color:#1b1b1b;font-size:15px;font-weight:bold;'
+            f'font-family:Arial,Helvetica,sans-serif;">{value}</td></tr>')
+
+
+def build_customer_email_html(sdbk, resource_name, order, addr_full, client_name,
+                              phone, access_token, event_id, start_utc, stop_utc, location):
+    """Brand-styled HTML booking confirmation for the CUSTOMER (no .ics chrome)."""
+    paid = is_paid(order)
+    amt = order.get("amount_total")
+    amt_str = f" &middot; ${amt:.2f} NZD" if amt else ""
+    when = f"{sdbk['time24']} ({sdbk['duration']}h) &middot; {_wday_mon(sdbk['date'])}"
+    dbase = dropoff_base(sdbk, resource_name)
+    first = (client_name or "there").split(" ")[0]
+
+    # status banner
+    if paid:
+        status = ('<div style="background:#e8f6ee;border:1px solid #bfe6cf;color:#1b7a45;'
+                  'padding:12px 14px;border-radius:8px;font-family:Arial,Helvetica,sans-serif;'
+                  'font-size:15px;font-weight:bold;">\U0001f4b0 Payment received &mdash; you\'re all booked in.</div>')
+    else:
+        status = ('<div style="background:#fff5e9;border:1px solid #f3d6ab;color:#8a5200;'
+                  'padding:12px 14px;border-radius:8px;font-family:Arial,Helvetica,sans-serif;'
+                  'font-size:15px;">⏳ <b>Awaiting payment</b> (pay by bank transfer)<br/>'
+                  f'<span style="font-size:14px;">How to pay: <b>{BANK_LINE}</b> &middot; '
+                  f'reference <b>{order.get("name")}</b></span></div>')
+
+    # location line: drop-off => base + Directions button; mobile => full address, no directions
+    if dbase:
+        loc_row = _row("Drop off at", f"{dbase}, Auckland")
+    else:
+        loc_row = _row("We come to", addr_full or (sdbk.get("suburb") + ", Auckland" if sdbk.get("suburb") else "your address"))
+
+    # buttons
+    btns = []
+    if phone:
+        btns.append(_btn("\U0001f4de Call", f"tel:{re.sub(r'[^\d+]', '', phone)}"))
+    if dbase:  # Directions only makes sense when the CUSTOMER is dropping the car off
+        q = urllib.parse.quote(f"{dbase}, Auckland")
+        btns.append(_btn("\U0001f9ed Directions", f"https://www.google.com/maps/search/?api=1&query={q}", bg="#333333"))
+    if access_token:
+        btns.append(_btn("\U0001f5d3 Reschedule", f"{SD_SITE}/reschedule?t={access_token}&e={event_id}", bg="#333333"))
+    gdetails = urllib.parse.quote(f"{sdbk['service_label']} with {resource_name}. Order {order.get('name')}.")
+    glocation = urllib.parse.quote(location or "Auckland")
+    gtitle = urllib.parse.quote(f"Supreme Detailing – {sdbk['service_label']}")
+    gcal = (f"https://calendar.google.com/calendar/render?action=TEMPLATE&text={gtitle}"
+            f"&dates={_z(start_utc)}/{_z(stop_utc)}&details={gdetails}&location={glocation}")
+    btns.append(_btn("➕ Add to Calendar", gcal, bg="#333333"))
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
+<body style="margin:0;padding:0;background:#f4f4f4;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f4;padding:24px 0;">
+<tr><td align="center">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#ffffff;border-radius:12px;overflow:hidden;">
+  <tr><td style="background:{SD_DARK};padding:22px 28px;text-align:center;">
+    <img src="{SD_LOGO}" alt="Supreme Detailing" width="180" style="max-width:180px;height:auto;"/>
+  </td></tr>
+  <tr><td style="padding:26px 28px 8px;">
+    <h1 style="margin:0 0 4px;font-family:Arial,Helvetica,sans-serif;font-size:22px;color:#1b1b1b;">Booking confirmed</h1>
+    <p style="margin:0 0 16px;font-family:Arial,Helvetica,sans-serif;font-size:15px;color:#555;">Hi {first}, thanks for booking with Supreme Detailing.</p>
+    {status}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:18px 0 4px;">
+      {_row("Service", sdbk['service_label'])}
+      {_row("When", when)}
+      {loc_row}
+      {_row("Detailer", resource_name)}
+      {_row("Order", str(order.get('name')) + amt_str)}
+    </table>
+    <div style="margin:14px 0 6px;">{''.join(btns)}</div>
+  </td></tr>
+  <tr><td style="padding:20px 28px 26px;border-top:1px solid #eee;text-align:center;">
+    <a href="{SD_IG_URL}" style="margin:0 6px;"><img src="{SD_IG_IMG}" alt="Instagram" width="26" style="width:26px;"/></a>
+    <a href="{SD_FB_URL}" style="margin:0 6px;"><img src="{SD_FB_IMG}" alt="Facebook" width="26" style="width:26px;"/></a>
+    <p style="margin:10px 0 0;font-family:Arial,Helvetica,sans-serif;font-size:12px;color:#999;">
+      <a href="{SD_SITE}" style="color:{SD_ORANGE};text-decoration:none;">supremedetailing.co.nz</a>
+      &middot; Auckland, New Zealand
+    </p>
+  </td></tr>
+</table>
+</td></tr></table></body></html>"""
 
 
 def append_order_marker(order, line_id, event_id):
@@ -1256,38 +1393,55 @@ def process(rec, writer):
     # --- Order-level audit token ---
     append_order_marker(order, lid, event_id)
 
-    # --- Fire the native "Appointment Booked" email (template 37 -> attendee) ---
+    # --- Send the BRANDED customer booking email (replaces the Google .ics invite) ---
+    # We send a plain HTML email (NOT the calendar-attendee template), so Gmail renders a
+    # clean branded email with no calendar-invite chrome. The detailer still has the event.
+    # Queued via mail.mail (state 'outgoing') so a SaaS daily-cap trip is retried by the mail
+    # cron rather than lost.
     mailed = "not-sent"
     if is_past:
         mailed = "past-no-email"
     elif ARGS.no_email:
         mailed = "no-email-flag"
-        log("      --no-email -- template 37 not sent")
+        log("      --no-email -- booking email not sent")
     elif not booker_id:
         mailed = "no-booker"
     elif not booker_email:
         mailed = "no-email-address"
-        log("      WARNING: booker has no email -- template 37 skipped")
+        log("      WARNING: booker has no email -- booking email skipped")
     else:
-        att = C.call("calendar.attendee", "search",
-                     [["event_id", "=", event_id], ["partner_id", "=", booker_id]], limit=1)
-        if att:
-            try:
-                # force_send=False -> queue via mail.mail. If the SaaS daily email cap is hit
-                # mid-backfill the message stays 'outgoing' and Odoo's mail cron RETRIES it
-                # automatically (force_send=True would raise synchronously and the confirmation
-                # would be lost forever, since a re-run finds the event already synced and
-                # never re-attempts the send).
-                C.call("mail.template", "send_mail", [BOOKED_TEMPLATE], att[0],
-                       force_send=False)
-                mailed = f"queued att{att[0]}"
-                log(f"      queued template {BOOKED_TEMPLATE} to attendee {att[0]} <{booker_email}>")
-            except Exception as e:
-                mailed = f"email-failed: {e}"
-                log(f"      WARNING: template {BOOKED_TEMPLATE} queue failed: {e}")
-        else:
-            mailed = "no-attendee"
-            log("      WARNING: no calendar.attendee found -- email skipped")
+        try:
+            att = C.call("calendar.attendee", "search_read",
+                         [["event_id", "=", event_id], ["partner_id", "=", booker_id]],
+                         fields=["id", "access_token"], limit=1)
+            atok = att[0].get("access_token") if att else ""
+            pa = C.call("res.partner", "read", [booker_id],
+                        fields=["street", "street2", "city", "zip"])
+            pa = pa[0] if pa else {}
+            addr_full = ", ".join(x for x in [
+                ", ".join(y for y in [pa.get("street"), pa.get("street2")] if y),
+                " ".join(y for y in [pa.get("city"), pa.get("zip")] if y),
+            ] if x) or (f"{sdbk.get('suburb')}, Auckland" if sdbk.get("suburb") else "")
+            subj = build_email_subject(sdbk, resource_name, partner_name)
+            html = build_customer_email_html(sdbk, resource_name, order, addr_full,
+                                             partner_name, booker_mobile, atok, event_id,
+                                             start_utc, stop_utc, location)
+            frm = ((C.call("res.users", "read", [ORGANIZER_USER], fields=["email_formatted"]) or [{}])[0]
+                   .get("email_formatted")) or "Supreme Detailing <bookings@supremedetailing.co.nz>"
+            mid = C.call("mail.mail", "create", [{
+                "subject": subj,
+                "body_html": html,
+                "email_to": booker_email,
+                "email_from": frm,
+                "author_id": ORGANIZER_PARTNER,
+                "state": "outgoing",
+            }], context=NOISE_OFF)
+            mid = mid[0] if isinstance(mid, (list, tuple)) else mid
+            mailed = f"branded mail.mail{mid}"
+            log(f"      queued BRANDED booking email -> mail.mail {mid} <{booker_email}>  subj={subj!r}")
+        except Exception as e:
+            mailed = f"email-failed: {e}"
+            log(f"      WARNING: branded booking email failed: {e}")
 
     writer.writerow([_now(), oname, lid, "created", event_id,
                      f"{start_utc}|type{sdbk['appt_type_id']}|res{resource_id}|{mailed}"])
