@@ -36,7 +36,7 @@ function doGet(e) {
     if (p.action === 'cbooking') return customerBooking_(p);       // JSONP: booking + availability
     if (p.action === 'creschedule') return customerReschedule_(p); // confirm the customer's new time
     // Swap + reschedule accept a static key (the staff-only /schedule page can't HMAC-sign); else verify the sig.
-    if (!((p.action === 'swap' || p.action === 'reschedule' || p.action === 'sharetoggle') && CFG.SWAP_KEY && p.key === CFG.SWAP_KEY)) verify_(p);
+    if (!((p.action === 'swap' || p.action === 'reschedule' || p.action === 'sharetoggle' || p.action === 'delete') && CFG.SWAP_KEY && p.key === CFG.SWAP_KEY)) verify_(p);
     if (p.action === 'menu') return htmlMenu_(p.event);   // Change-stage menu
     if (p.action === 'paid') return htmlPayMenu_(p.event); // Mark-paid -> choose method
     if (p.action === 'reschedule') {   // /schedule gantt drag -> move the booking's time (+ optional lane)
@@ -64,6 +64,15 @@ function doGet(e) {
       var toName = (cur === 1) ? 'Kade' : 'Alex';   // 1=Alex, 2=Kade -> the other
       dispatchReassign_(p.event, toName);
       return page_('Swapping this booking to <b>' + toName + '</b> — the calendar updates in a few seconds.', true);
+    }
+    if (p.action === 'delete') {   // /schedule card "Delete" -> archive event + free the slot hold (instant)
+      var delId = parseInt(p.event, 10);
+      if (!delId) return page_('Bad booking id.', false);
+      execKw_(uid, 'calendar.event', 'write', [[delId], { active: false }]);   // archive -> off the calendar
+      var delHolds = execKw_(uid, 'appointment.booking.line', 'search',
+                             [[['calendar_event_id', '=', delId]]], { context: { active_test: false } });
+      if (delHolds && delHolds.length) execKw_(uid, 'appointment.booking.line', 'unlink', [delHolds]);
+      return page_('Booking deleted — it is off the schedule and the time slot is freed.', true);
     }
     var oppId = resolveOpp_(uid, p.event);
 
@@ -298,11 +307,28 @@ function postRescheduleCard_(uid, eid, cfg) {
   var when = fmtNZ_(ev.start);
   var wasUtc = lastWas_(uid, eid);
   var was = wasUtc ? fmtNZ_(wasUtc) : '';
-  var widgets = [{ decoratedText: { topLabel: 'Customer', text: cust } },
-                 { decoratedText: { topLabel: 'Service', text: svc } }];
+
+  // Full street address + mobile from the booker's partner record. ev.location is only
+  // 'Suburb, Auckland' (no street), so read the partner for the street the detailer drives to.
+  // NB: SaaS 19.2 has no res.partner.mobile field — the mobile lives in `phone`. Drop ', Auckland'.
+  var where = '', mobile = '';
+  var bpid = (ev.appointment_booker_id && ev.appointment_booker_id[0]) || 0;
+  if (bpid) {
+    var pr = execKw_(uid, 'res.partner', 'read', [[bpid], ['street', 'street2', 'city', 'phone']]);
+    if (pr && pr[0]) {
+      var street = [pr[0].street, pr[0].street2].filter(Boolean).join(', ');
+      where = [street, pr[0].city].filter(Boolean).join(', ');
+      mobile = pr[0].phone || '';
+    }
+  }
+  if (!where) where = String(ev.location || '').replace(/,?\s*Auckland\s*$/i, '');
+
+  var widgets = [{ decoratedText: { topLabel: 'Customer', text: cust } }];
+  if (mobile) widgets.push({ decoratedText: { topLabel: 'Mobile', text: mobile } });
+  widgets.push({ decoratedText: { topLabel: 'Service', text: svc } });
   if (was) widgets.push({ decoratedText: { topLabel: 'Was', text: was } });
   widgets.push({ decoratedText: { topLabel: 'Now', text: when } });
-  if (ev.location) widgets.push({ decoratedText: { topLabel: 'Where', text: ev.location } });
+  if (where) widgets.push({ decoratedText: { topLabel: 'Where', text: where } });
   widgets.push({ decoratedText: { topLabel: 'Detailer', text: RES_NAME[rid] || '' } });
   var payload = {
     text: '🔁 *Rescheduled* — ' + cust + ' · ' + (was ? was + ' → ' : '') + when + ' · ' + svc,
@@ -402,11 +428,22 @@ function customerBooking_(p) {
     var at = execKw_(uid, 'appointment.type', 'read',
       [[(ev.appointment_type_id && ev.appointment_type_id[0]) || 0], ['min_schedule_hours', 'min_cancellation_hours']]);
     var lead = (at && at[0]) ? (at[0].min_schedule_hours || 0) : 0;
+    // Full street address for the summary "Where" (from the booker's partner; ev.location is only 'Suburb, Auckland').
+    var addr = '';
+    var abpid = (ev.appointment_booker_id && ev.appointment_booker_id[0]) || 0;
+    if (abpid) {
+      var apr = execKw_(uid, 'res.partner', 'read', [[abpid], ['street', 'street2', 'city']]);
+      if (apr && apr[0]) {
+        var ast = [apr[0].street, apr[0].street2].filter(Boolean).join(', ');
+        addr = [ast, apr[0].city].filter(Boolean).join(', ');
+      }
+    }
+    if (!addr) addr = String(ev.location || '').replace(/,?\s*Auckland\s*$/i, '');
     return _jsonp(cb, {
       ok: true, event: eid,
       cust: (ev.appointment_booker_id && ev.appointment_booker_id[1]) || '',
       service: (ev.appointment_type_id && ev.appointment_type_id[1]) || 'Booking',
-      suburb: ev.location || '', resId: String(resId), resName: RES_NAME[resId] || '',
+      suburb: ev.location || '', address: addr, resId: String(resId), resName: RES_NAME[resId] || '',
       durMin: durMin, curDay: cur ? cur.day : '', curStartMin: cur ? cur.min : 0,
       hours: resHours_(uid, resId), taken: taken, leadHours: lead
     });
