@@ -760,7 +760,41 @@ SD_IG_IMG = "https://supreme-detailing-assets.netlify.app/instagram.png?v=2"
 SD_FB_IMG = "https://supreme-detailing-assets.netlify.app/facebook.png?v=2"
 SD_IG_URL = "https://www.instagram.com/supremedetailing.co.nz/"
 SD_FB_URL = "https://www.facebook.com/profile.php?id=61590860083780"
-BANK_LINE = "Alex MacLeod (Supreme Detailing) &middot; 03-0275-0076063-001"
+# Customer-facing "how to pay" line for the booking email + the .ics description. Resolved from
+# the PERFORMING detailer's own res.partner.bank (RESOURCE_BANK) so Alex's jobs quote Alex's
+# account and Kade's quote Kade's -- they run their own regions and collect their own money.
+# Read from Odoo rather than hardcoded ON PURPOSE: a hardcoded copy is exactly how
+# res.company.report_footer ended up advertising a DEAD account for a month after the number
+# changed. Change the account in Odoo and these emails follow automatically.
+BANK_LINE_FALLBACK = "Alex MacLeod (Supreme Detailing) &middot; 03-0275-0076063-001"
+_bank_line_cache = {}
+
+
+def bank_line_for(resource_name):
+    """'<holder> &middot; <account_number>' for the detailer performing THIS booking.
+    Cached per resource for the life of the pass. Falls back to Alex's line (never to a blank)
+    so a customer always gets something payable."""
+    rid = resolve_resource(resource_name)
+    if rid in _bank_line_cache:
+        return _bank_line_cache[rid]
+    line = BANK_LINE_FALLBACK
+    bank_id = RESOURCE_BANK.get(rid)
+    if not bank_id:
+        log(f"    BANK: resource {resource_name!r} (id {rid!r}) has no RESOURCE_BANK entry -- "
+            f"customer email/.ics will quote the fallback account. Add it to RESOURCE_BANK.")
+    else:
+        try:
+            b = C.call("res.partner.bank", "read", [bank_id],
+                       fields=["holder_name", "account_number"])[0]
+            if b.get("holder_name") and b.get("account_number"):
+                line = f"{b['holder_name']} &middot; {b['account_number']}"
+            else:
+                log(f"    BANK: bank {bank_id} is missing holder_name/account_number -- using fallback")
+        except Exception as e:  # noqa: BLE001 - never let a bank read kill a booking email
+            log(f"    BANK: could not read bank {bank_id} for {resource_name!r} "
+                f"({type(e).__name__}: {e}) -- using fallback")
+    _bank_line_cache[rid] = line
+    return line
 
 _WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 _MO = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -825,7 +859,7 @@ def build_customer_email_html(sdbk, resource_name, order, addr_full, client_name
         status = ('<div style="background:#fff5e9;border:1px solid #f3d6ab;color:#8a5200;'
                   'padding:12px 14px;border-radius:8px;font-family:Arial,Helvetica,sans-serif;'
                   'font-size:15px;">⏳ <b>Awaiting payment</b> (pay by bank transfer)<br/>'
-                  f'<span style="font-size:14px;">How to pay: <b>{BANK_LINE}</b> &middot; '
+                  f'<span style="font-size:14px;">How to pay: <b>{bank_line_for(resource_name)}</b> &middot; '
                   f'reference <b>{order.get("name")}</b></span></div>')
 
     # location line: drop-off => base + Directions button; mobile => full address, no directions
@@ -897,7 +931,7 @@ def build_ics_attachment(sdbk, resource_name, order, location, start_utc, stop_u
                 .replace(",", "\\,").replace("\n", "\\n"))
     dbase = dropoff_base(sdbk, resource_name)
     loc = f"{dbase}, Auckland" if dbase else (location or "Auckland")
-    bank_plain = BANK_LINE.replace("&middot;", "-")  # .ics is plain text, not HTML
+    bank_plain = bank_line_for(resource_name).replace("&middot;", "-")  # .ics is plain text, not HTML
     desc = (f"{sdbk['service_label']} with {resource_name}. Order {order.get('name')}. "
             f"Pay by bank transfer: {bank_plain} - reference {order.get('name')}.")
     ics = "\r\n".join([
