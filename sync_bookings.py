@@ -600,24 +600,31 @@ def already_synced(order, line_id, booker_partner_id, start_utc, appt_type_id):
     2. BOUNDED per-line marker (full HTML comment) in the event description.
     3. Natural key (booker partner + exact start + appointment type).
     """
-    # 1. order-ref token (cheap, one existence check). The token can outlive its event if
-    #    someone deletes the event in the backend -> verify the id still exists, else fall
-    #    through to re-create (otherwise every run would error writing to a ghost id).
+    # 1. order-ref token. The token can outlive its event if someone removes the event in
+    #    the backend, so every generation is resolved against the DB *including archived*
+    #    rows: archived == cancelled (must stick), missing == genuinely unlinked (re-create).
     ref = order.get("client_order_ref") or ""
     tok_prefix = f"SDCAL:L{line_id}=E"
-    idx = ref.find(tok_prefix)
-    if idx != -1:
-        tail = ref[idx + len(tok_prefix):]
-        num = ""
-        for ch in tail:
-            if ch.isdigit():
-                num += ch
-            else:
-                break
-        if num:
-            if C.call("calendar.event", "search", [["id", "=", int(num)]], limit=1):
-                return int(num)
-            vlog(f"L{line_id}: order-ref token points to deleted event {num} -> re-create")
+    # Read EVERY generation of this line's token, not just the first. The token is APPENDED on
+    # each re-create, so a resurrected line reads e.g. "SDCAL:L626=E66;SDCAL:L626=E80;SDCAL:L626=E86".
+    # Only reading the first one meant a stale genuinely-deleted id (E66) masked a LATER
+    # generation that had been ARCHIVED (E80/E86) -- i.e. the customer cancelled, and we
+    # resurrected the booking anyway because we never looked past the first token.
+    gens = [int(n) for n in re.findall(re.escape(tok_prefix) + r"(\d+)", ref)]
+    if gens:
+        rows = C.call("calendar.event", "search_read", [["id", "in", gens]],
+                      fields=["id", "active"], context={"active_test": False})
+        live = [r["id"] for r in rows if r["active"]]
+        archived = [r["id"] for r in rows if not r["active"]]
+        if live:
+            return live[-1]                     # the current event for this line
+        if archived:
+            # every surviving generation is archived => the booking was CANCELLED. A
+            # cancellation must STICK, whichever generation it landed on.
+            vlog(f"L{line_id}: token generations {gens} -> archived {archived} "
+                 f"(booking cancelled) -> NOT re-creating")
+            return "CANCELLED"
+        vlog(f"L{line_id}: token generations {gens} all genuinely deleted (unlinked) -> re-create")
 
     # 2. BOUNDED marker search (full comment -> no L12/L123 collision). Include ARCHIVED:
     #    an archived match = the booking was CANCELLED via the "Delete booking" action, so
