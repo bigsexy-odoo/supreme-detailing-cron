@@ -80,6 +80,48 @@ python sync_bookings.py --commit --max 3 --verbose
 
 ---
 
+## Credentials the cron depends on (read this FIRST when every workflow starts failing)
+
+GitHub → Settings → Secrets and variables → Actions → **Secrets**:
+
+| Secret | Value | Notes |
+|---|---|---|
+| `ODOO_URL` | `https://www.supremedetailing.co.nz` | must be the **www** host |
+| `ODOO_DB` | `supremedetailing` | |
+| `ODOO_USER` | the Odoo **login email** | ⚠️ see below |
+| `ODOO_API_KEY` | Odoo → avatar → My Profile → Account Security → New API Key | |
+
+**`ODOO_USER` is the login string, not the API key — and it breaks independently of it.**
+XML-RPC authenticates as `authenticate(db, LOGIN, api_key)`, so if the Odoo account's email
+changes, every workflow fails at the door with a valid key. `authenticate` just returns `False`;
+there is no "wrong username" error to read.
+
+Happened 2026-07-28: Odoo changed the account email from `mjnoone87@gmail.com` to
+`admin@supremedetailing.co.nz` during an ownership transfer. Same account, same uid 2, same key —
+but eight workflows went down, including `sync-bookings`, which silently stops turning paid
+bookings into calendar events, invoices and emails. Fix was one line:
+
+```bash
+gh secret set ODOO_USER --repo bigsexy-odoo/supreme-detailing-cron --body "<new login email>"
+```
+
+Diagnose in seconds — this distinguishes a dead key from a stale login:
+
+```python
+import xmlrpc.client
+common = xmlrpc.client.ServerProxy("https://www.supremedetailing.co.nz/xmlrpc/2/common")
+print(common.version())                                   # server reachable?
+print(common.authenticate("supremedetailing", LOGIN, KEY, {}))   # uid, or False
+```
+
+Verify the fix without waiting for the schedule — `commit` defaults to `no`, so this is a dry run:
+
+```bash
+gh workflow run sync-bookings.yml --repo bigsexy-odoo/supreme-detailing-cron
+```
+
+---
+
 ## CRM step (added 2026-07-09, live)
 
 Every pass also runs `ensure_crm_opps()`: ONE opportunity per booked (eligible) order —
