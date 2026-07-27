@@ -337,6 +337,28 @@ function postRescheduleCard_(uid, eid, cfg) {
   widgets.push({ decoratedText: { topLabel: 'Now', text: when } });
   if (where) widgets.push({ decoratedText: { topLabel: 'Where', text: where } });
   widgets.push({ decoratedText: { topLabel: 'Detailer', text: RES_NAME[rid] || '' } });
+
+  // Button parity with the booking card (added 2026-07-28). A rescheduled job should be as
+  // actionable as a new one -- this card used to tell the detailer a job had moved and then make
+  // them go and find it. Same construction as booking_card.py: phone stripped to digits/+ for the
+  // tel: link, ', Auckland' appended to the maps query only when not already present, and the
+  // schedule button pointing at the PUBLIC /schedule page (no Odoo backend login).
+  var btns = [];
+  if (mobile) {
+    btns.push({ text: '\uD83D\uDCDE Call',
+                onClick: { openLink: { url: 'tel:' + String(mobile).replace(/[^\d+]/g, '') } } });
+  }
+  if (where) {
+    var mapQ = /auckland/i.test(where) ? where : where + ', Auckland';
+    btns.push({ text: '\uD83E\uDDED Directions',
+                onClick: { openLink: { url: 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(mapQ) } } });
+  }
+  if (CFG.ODOO_URL) {
+    btns.push({ text: '\uD83D\uDCC5 Open schedule (gantt)',
+                onClick: { openLink: { url: String(CFG.ODOO_URL).replace(/\/+$/, '') + '/schedule' } } });
+  }
+  if (btns.length) widgets.push({ buttonList: { buttons: btns } });
+
   var payload = {
     text: '🔁 *Rescheduled* — ' + cust + ' · ' + (was ? was + ' → ' : '') + when + ' · ' + svc,
     cardsV2: [{ cardId: 'resched-' + eid, card: { header: { title: '🔁 Booking rescheduled', subtitle: (was ? was + '  →  ' + when : when) }, sections: [{ widgets: widgets }] } }]
