@@ -128,6 +128,15 @@ RESOURCE_TAG = {1: 1, 2: 2}   # appointment.resource id -> calendar.event.type (
 # and the colour disappears. FIX: the detailer contacts MUST carry an email. ensure the
 # owner sets a real one; ensure_detailer_attendee() warns loudly if it's missing. ***
 RESOURCE_PARTNER = {1: 69, 2: 70}   # appointment.resource id -> detailer CONTACT (res.partner, MUST have email)
+# appointment.resource id -> the detailer's OWN res.partner.bank. Alex and Kade run their own
+# regions and collect their own money, so the invoice must name the PERFORMING detailer's account.
+# Both banks hang off the COMPANY partner (1): the invoice form's recipient-bank widget is
+# domain="[('partner_id.ref_company_ids','parent_of',company_id)]" and the detailer contacts
+# (69/70) have ref_company_ids=[], so a bank on THEM would be invisible/uneditable in the UI.
+# Both records are TRUSTED (allow_out_payment=True) -- an untrusted company bank makes
+# account.move.action_post HARD-FAIL, which strands the invoice in DRAFT and silently kills the
+# posted-only invoice email #10.
+RESOURCE_BANK = {1: 1, 2: 2}        # 1=Alex 03-0275-0076063-001, 2=Kade 12-3019-0787812-51
 # Contacts, not Odoo user accounts -> no paid seats. Set the sidebar swatches green
 # (Alex/North Shore) / red (Kade/Central) once. Paid status is shown by a ✅ tick in the
 # TITLE (not by colour), so a glance gives detailer (colour) + paid (tick) + type + suburb.
@@ -1221,14 +1230,29 @@ def confirm_and_invoice_order(order, recs, writer):
     # pre-existing draft was left unposted forever -> the invoice email (#10, posted-only) never
     # fired. Post it here so Awaiting-Payment invoices always email.
     if not ARGS.dry_run:
+        # PER-DETAILER BANK: the invoice must ask for payment into the PERFORMING detailer's own
+        # account. Primary detailer wins on a mixed cart (one order -> one invoice -> one payee;
+        # the boys settle between themselves) -- same first-line rule the CRM team routing uses.
+        # This MUST ride in the same write as the payment term, i.e. BEFORE action_post, because
+        # (a) the bank-trust check fires at post time, so the bank present at post is the one
+        # validated, and (b) the form marks partner_bank_id readonly once is_move_sent is set,
+        # which the invoice email does moments later -- after that it is RPC-only and invisible.
+        inv_rid = resolve_resource(recs[0]["sdbk"]["resource_name"]) if recs else None
+        inv_bank = RESOURCE_BANK.get(inv_rid)
         drafts = [i for i, st in _order_out_invoices(order["id"]) if st == "draft"]
         for d in drafts:
-            C.call("account.move", "write", [d],
-                   {"invoice_payment_term_id": DUE_ON_RECEIPT_TERM}, context=NOISE_OFF)
+            vals = {"invoice_payment_term_id": DUE_ON_RECEIPT_TERM}
+            if inv_bank:
+                vals["partner_bank_id"] = inv_bank
+            C.call("account.move", "write", [d], vals, context=NOISE_OFF)
             C.call("account.move", "action_post", [d])
         if drafts:
+            bank_note = f" bank={inv_bank}(res{inv_rid})" if inv_bank else " bank=DEFAULT(unresolved resource)"
             acts.append(f"posted:{drafts}")
-            log(f"    INV {oname}: posted invoice(s) {drafts} (Due on receipt / Awaiting Payment)")
+            log(f"    INV {oname}: posted invoice(s) {drafts} (Due on receipt / Awaiting Payment){bank_note}")
+        if drafts and not inv_bank:
+            log(f"    INV {oname}: WARNING resource {inv_rid!r} has no bank in RESOURCE_BANK -- "
+                f"invoice keeps Odoo's default account. Check RESOURCE_BANK covers every resource.")
     posted = [i for i, st in _order_out_invoices(order["id"]) if st == "posted"]
     inv_id = posted[0] if posted else (invs[0][0] if invs else None)
 
