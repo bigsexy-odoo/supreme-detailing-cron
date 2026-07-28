@@ -55,3 +55,16 @@ jobs:
           ODOO_USER: ${{ secrets.ODOO_USER }}
           ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
         run: python tag_contact_origin.py --commit
+
+      # EMAILS REAL CUSTOMERS -- deliberately inert until the owner opts in.
+      # Turn on with:  gh variable set INVITE_PORTAL_ENABLED --body true --repo <this repo>
+      # --max 3 keeps it well under the SaaS daily email cap; anyone left over is picked up
+      # on the next run, and the "Portal invited" tag means nobody is ever emailed twice.
+      - name: Invite paying customers to the portal
+        if: always() && steps.gate.outputs.run == 'yes' && vars.INVITE_PORTAL_ENABLED == 'true'
+        env:
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USER: ${{ secrets.ODOO_USER }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+        run: python invite_portal_access.py --commit --max 3
