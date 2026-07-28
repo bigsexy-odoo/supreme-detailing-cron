@@ -130,6 +130,33 @@ jobs:
           GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}  # blank-booking watchdog alerts
         run: python sync_bookings.py ${{ steps.flags.outputs.flags }} --verbose
 
+      # Gift cards ride THIS job rather than a workflow of their own. A separate
+      # */15 workflow would bill its own minimum-1-minute per run (~2,880 min/mo,
+      # over the free tier) for work that takes seconds -- Rule 11 says take the
+      # free path. As a step here it costs no extra Actions minutes, and a gift
+      # code reaches the recipient within minutes instead of waiting for the
+      # daily loyalty.yml batch (13:00 UTC), which is far too slow for a present.
+      - name: Sync gift cards (assign giftee + send the code)
+        if: steps.gate.outputs.run == 'yes'
+        env:
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USER: ${{ secrets.ODOO_USER }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+          SYNC_ENABLED: ${{ vars.SYNC_BOOKINGS_ENABLED }}
+        run: |
+          GFLAGS=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ github.event.inputs.commit }}" = "yes" ]; then GFLAGS="--commit"; fi
+            if [ "${{ github.event.inputs.no_email }}" = "yes" ]; then GFLAGS="$GFLAGS --no-email"; fi
+          elif [ "$SYNC_ENABLED" = "true" ]; then
+            GFLAGS="--commit"
+          else
+            echo "SYNC_BOOKINGS_ENABLED != true -> DRY-RUN only"
+          fi
+          echo "gift-card flags: '$GFLAGS'"
+          python sync_giftcards.py $GFLAGS --verbose
+
       - name: Upload run log
         if: steps.gate.outputs.run == 'yes'
         uses: actions/upload-artifact@v4

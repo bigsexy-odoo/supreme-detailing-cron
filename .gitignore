@@ -21,3 +21,5 @@ _reaper_*.py
 _reaper_*.txt
 
 gbp_client_secret.json
+_ct_id.txt
+backups/_*

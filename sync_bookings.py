@@ -510,7 +510,9 @@ def discover_bookings():
     orders = C.call("sale.order", "read", order_ids,
                     fields=["id", "name", "state", "partner_id", "client_order_ref",
                             "date_order", "website_id", "amount_total", "transaction_ids",
-                            "opportunity_id", "invoice_ids", "payment_term_id"])
+                            "opportunity_id", "invoice_ids", "payment_term_id",
+                            # campaign attribution -> carried onto the opportunity
+                            "source_id", "medium_id", "campaign_id"])
     order_map = {o["id"]: o for o in orders}
 
     records = []
@@ -1075,6 +1077,32 @@ def _order_event_ids(order):
     return [int(m.group(1)) for m in re.finditer(r"SDCAL:L\d+=E(\d+)", ref)]
 
 
+UTM_FIELDS = ("source_id", "medium_id", "campaign_id")
+
+
+def _utm_vals(order):
+    """The order's campaign attribution, as writeable {field: id} values.
+
+    Odoo populates source/medium/campaign on the ORDER by itself: utm.mixin reads the
+    odoo_utm_* cookies that are set when a visitor lands on a ?utm_source=... URL, and
+    /shop/cart/add (which the custom cart calls) writes them onto the new sale.order.
+    Verified end-to-end 2026-07-28 - a headless visit carrying utm params produced an
+    order with source/medium/campaign all populated, and Odoo auto-created the missing
+    utm.source record.
+
+    What does NOT happen by itself: this cron CREATES the opportunity, so the opp
+    inherits none of it. Without this copy the CRM can tell you which campaign produced
+    CLICKS but never which produced REVENUE - the only question worth asking of a
+    marketing spend.
+    """
+    out = {}
+    for f in UTM_FIELDS:
+        v = order.get(f)
+        if v:
+            out[f] = v[0] if isinstance(v, (list, tuple)) else v
+    return out
+
+
 def ensure_crm_opp(order, recs, writer):
     """Create/upgrade THE opportunity for a booked order. Returns an outcome string.
 
@@ -1105,7 +1133,8 @@ def ensure_crm_opp(order, recs, writer):
 
     if opp_id:
         opp = C.call("crm.lead", "read", [opp_id],
-                     fields=["id", "name", "stage_id", "expected_revenue", "tag_ids", "active"],
+                     fields=["id", "name", "stage_id", "expected_revenue", "tag_ids",
+                             "active", *UTM_FIELDS],
                      context={"active_test": False})
         opp = opp[0] if opp else None
         if not opp:
@@ -1123,6 +1152,11 @@ def ensure_crm_opp(order, recs, writer):
             missing_tags = [t for t in tag_ids if t not in (opp.get("tag_ids") or [])]
             if missing_tags:
                 vals["tag_ids"] = [(4, t) for t in missing_tags]
+            # Backfill attribution onto an opp that predates this copy, but never
+            # OVERWRITE a value already there - a human may have set it deliberately.
+            for f, v in _utm_vals(order).items():
+                if not opp.get(f):
+                    vals[f] = v
             link_order = adopted or not order.get("opportunity_id")
             unlinked_evs = []
             if ev_ids:
@@ -1169,9 +1203,12 @@ def ensure_crm_opp(order, recs, writer):
         "date_deadline": dates[0] if dates else False,
         "description": "<br/>".join(desc_lines),
     }
+    utm = _utm_vals(order)
+    vals.update(utm)
     if ARGS.dry_run:
         log(f"    CRM {order['name']}: DRY-RUN would create opp "
-            f"[team {team_id}, stage {target_stage}, ${vals['expected_revenue']}]")
+            f"[team {team_id}, stage {target_stage}, ${vals['expected_revenue']}]"
+            f"{' utm=' + str(utm) if utm else ' (no campaign attribution on the order)'}")
         return "crm-would-create"
     res = C.call("crm.lead", "create", vals, context=NOISE_OFF)
     opp_id = res[0] if isinstance(res, (list, tuple)) else res   # Rule 10a: create returns [id]
@@ -1181,7 +1218,7 @@ def ensure_crm_opp(order, recs, writer):
         C.call("calendar.event", "write", ev_ids, {"opportunity_id": opp_id}, context=NOISE_OFF)
     log(f"    CRM {order['name']}: created opp {opp_id} [team {team_id}, "
         f"stage {'Booked' if paid else 'Booked (Unpaid)'}, ${vals['expected_revenue']}] "
-        f"events={ev_ids}")
+        f"events={ev_ids}{' utm=' + str(utm) if utm else ''}")
     writer.writerow([_now(), order["name"], "", "crm-created", opp_id,
                      f"team{team_id}|stage{target_stage}|{vals['expected_revenue']}"])
     return "crm-created"
