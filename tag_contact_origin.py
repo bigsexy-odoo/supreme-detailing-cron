@@ -55,7 +55,13 @@ T_COMPANY = "Company"
 
 # name -> colour index used when the tag has to be created
 TAG_COLOURS = {T_BOOKING: 10, T_SIGNUP: 4, T_MANUAL: 3, T_FOUNDER: 9, T_COMPANY: 1}
-ORIGIN_TAGS = set(TAG_COLOURS)
+
+# Tags the SITE's own forms already apply. They say where the contact came from just as well
+# as ours do, so treat them as origin markers and leave those contacts alone -- otherwise a
+# subscription pre-registration (created by Public user, no order) gets "Website signup"
+# stacked on top of "Subscription Interest", which reads as a portal account it never had.
+SITE_FORM_TAGS = {"Subscription Interest", "Website Enquiry", "Cart Save"}
+ORIGIN_TAGS = set(TAG_COLOURS) | SITE_FORM_TAGS
 
 COMPANY_PARTNER_IDS = {1, 3}          # Supreme Detailing + Supreme Bookings
 STAFF_EMAIL_DOMAIN = "@supremedetailing.co.nz"
@@ -103,6 +109,11 @@ def main():
     c = OdooClient()
     tag_ids = ensure_tags(c, commit)
     by_id = {v: k for k, v in tag_ids.items()}
+    # Include the site's own form tags in the lookup so we can SEE them on a contact and
+    # stand down. We never create these -- if a form tag doesn't exist yet, nothing to respect.
+    for t in c.call("res.partner.category", "search_read",
+                    [["name", "in", sorted(SITE_FORM_TAGS)]], fields=["id", "name"]):
+        by_id[t["id"]] = t["name"]
 
     partners = c.call(
         "res.partner", "search_read", [["active", "=", True]],
