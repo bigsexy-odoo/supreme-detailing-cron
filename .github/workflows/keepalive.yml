@@ -1,0 +1,31 @@
+name: Keepalive
+
+# GitHub auto-disables EVERY scheduled workflow in a PUBLIC repo once the repo has
+# had no commits for 60 days (docs: "Disabling and enabling a workflow"). This repo
+# only changes when a job needs a fix, so it goes quiet for months at a time — and
+# the routers/syncs would silently stop. A weekly empty commit is "repository
+# activity" by GitHub's own definition and resets the 60-day clock. Pushes made with
+# GITHUB_TOKEN never trigger other workflows, so this cannot recurse.
+on:
+  schedule:
+    - cron: "0 14 * * 0"    # Sunday 14:00 UTC = Monday ~02:00-03:00 NZ (off-peak)
+  workflow_dispatch: {}     # manual "Run workflow" to reset the clock on demand
+
+permissions:
+  contents: write           # push the heartbeat commit (repo default is read-only)
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Push empty heartbeat commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "keepalive: $(date -u +%Y-%m-%d) — keep scheduled workflows enabled"
+          git push

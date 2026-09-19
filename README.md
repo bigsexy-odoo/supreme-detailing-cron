@@ -15,6 +15,7 @@ See `../MIGRATION_billable-loc.md` for the full plan, and the global
 | `loyalty_maintenance_external.py` | server action #760 + cron 62 | daily 13:00 UTC | 12-month card expiry + membership credit per posted membership invoice |
 | `chat_poster.py` | (part of #562 replacement) | imported | Google Chat poster (`lead_to_message` / `post_to_chat`) |
 | `odoo_client.py` | — | imported | XML-RPC client; reads creds from env (secrets) then `.env` |
+| `.github/workflows/keepalive.yml` | — | weekly, Sun 14:00 UTC | empty heartbeat commit so GitHub's 60-day public-repo inactivity rule never disables the schedules above |
 
 Stdlib-only — **no `pip install`** on the runner.
 
