@@ -956,7 +956,9 @@ def build_ics_attachment(sdbk, resource_name, order, location, start_utc, stop_u
     try:
         aid = C.call("ir.attachment", "create", [{
             "name": "supreme-detailing-booking.ics",
-            "datas": base64.b64encode(ics.encode("utf-8")).decode("ascii"),
+            # saas-19.3 dropped ir.attachment.datas on create (asserts in _postprocess_contents) --
+            # "raw" takes the same base64 over RPC; every .ics since the 2026-08-19 upgrade had failed here
+            "raw": base64.b64encode(ics.encode("utf-8")).decode("ascii"),
             "mimetype": "text/calendar; method=PUBLISH; charset=UTF-8",
             "res_model": "mail.mail", "res_id": 0,
         }], context=NOISE_OFF)
@@ -1319,7 +1321,9 @@ def confirm_and_invoice_order(order, recs, writer):
         inv_bank = RESOURCE_BANK.get(inv_rid)
         drafts = [i for i, st in _order_out_invoices(order["id"]) if st == "draft"]
         for d in drafts:
-            vals = {"invoice_payment_term_id": DUE_ON_RECEIPT_TERM}
+            # ref: Odoo copies client_order_ref (our SDCAL audit token) onto the invoice, where the
+            # stock report prints it as "Reference" and report 790 used it as the PDF filename. Blank it.
+            vals = {"invoice_payment_term_id": DUE_ON_RECEIPT_TERM, "ref": False}
             if inv_bank:
                 vals["partner_bank_id"] = inv_bank
             C.call("account.move", "write", [d], vals, context=NOISE_OFF)

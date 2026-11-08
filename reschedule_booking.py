@@ -216,7 +216,7 @@ def main():
                                     sequence_now(), org_email, org[1] or "Supreme Detailing", bemail, bname)
                     aid = c.call("ir.attachment", "create", [{
                         "name": "invite.ics", "type": "binary", "mimetype": "text/calendar",
-                        "datas": base64.b64encode(ics.encode("utf-8")).decode("ascii")}])
+                        "raw": base64.b64encode(ics.encode("utf-8")).decode("ascii")}])  # saas-19.3: datas gone, raw = base64
                     aid = aid[0] if isinstance(aid, list) else aid
                     ev_vals = {"attachment_ids": [(6, 0, [aid])]}
                 c.call("mail.template", "send_mail", [RESCHEDULE_TEMPLATE_ID], att[0],
